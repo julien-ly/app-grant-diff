@@ -1,0 +1,45 @@
+{
+  "description": "Expected application permissions for the principals in scope.",
+  "complete": true,
+  "asOf": "2026-09-15T00:00:00Z",
+  "principals": [
+    {
+      "appId": "11112222-bbbb-3333-cccc-4444dddd5555",
+      "displayName": "Invoice ingestion job",
+      "complete": true,
+      "comment": "Has a local registration. The expected side comes from requiredResourceAccess; complete is what makes over-coverage establishable."
+    },
+    {
+      "appId": "22223333-cccc-4444-dddd-5555eeee6666",
+      "displayName": "Retired reporting connector",
+      "complete": true,
+      "comment": "Registration emptied, grant never revoked. Expected to surface as OverCoverage."
+    },
+    {
+      "appId": "33334444-dddd-5555-eeee-6666ffff7777",
+      "displayName": "Third-party archiving service",
+      "complete": true,
+      "comment": "No local registration. permissions is the only declared state that can exist for this principal.",
+      "permissions": [
+        {
+          "resourceAppId": "00000003-0000-0000-c000-000000000000",
+          "value": "Mail.Read",
+          "expectedGranted": true
+        }
+      ]
+    },
+    {
+      "appId": "44445555-eeee-6666-ffff-7777aaaa8888",
+      "displayName": "Directory read sentinel",
+      "complete": true,
+      "comment": "Negative expectation. requiredResourceAccess cannot express it; only the manifest can.",
+      "permissions": [
+        {
+          "resourceAppId": "00000003-0000-0000-c000-000000000000",
+          "value": "Directory.ReadWrite.All",
+          "expectedGranted": false
+        }
+      ]
+    }
+  ]
+}

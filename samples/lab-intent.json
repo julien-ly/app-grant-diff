@@ -1,0 +1,71 @@
+{
+  "description": "Intention pour le corpus de test app-grant-diff. Attentes ecrites a la main, identifiants resolus depuis le tenant.",
+  "complete": true,
+  "asOf": "2026-09-16T10:12:14Z",
+  "principals": [
+    {
+      "appId": "1fe6aac0-385b-4b6f-8711-df3071b6071f",
+      "displayName": "agd-lab-a-declare-non-accorde",
+      "complete": true,
+      "comment": "Inscription locale. Le cote attendu vient de requiredResourceAccess : User.Read.All declare, non consenti."
+    },
+    {
+      "appId": "d7762851-5a13-46ea-962a-24c42bc94258",
+      "displayName": "agd-lab-b-accorde-non-declare",
+      "complete": true,
+      "comment": "Inscription locale, manifeste Entra vide. complete est ce qui transforme le grant orphelin en OverCoverage : c est la seule difference entre les deux colonnes."
+    },
+    {
+      "appId": "00000002-0000-0ff1-ce00-000000000000",
+      "displayName": "Office 365 Exchange Online",
+      "complete": true,
+      "comment": "Aucune inscription locale. permissions est ici le seul etat declare qui existe.",
+      "permissions": []
+    },
+    {
+      "appId": "4f7cc8d1-9946-4e6f-908f-ee5689a37f83",
+      "displayName": "agd-lab-d-aligne",
+      "complete": true,
+      "comment": "Declare et accorde identiques."
+    },
+    {
+      "appId": "ea37239a-1c5d-4bfa-a249-5e299933569e",
+      "displayName": "agd-lab-e-controle-negatif",
+      "complete": true,
+      "comment": "Controle negatif. Son assertion porte sur conclusion.result et assessment.completeness, pas sur un etat de ligne."
+    },
+    {
+      "appId": "5bb11515-4d37-4034-8520-fc88c8a6c1f5",
+      "displayName": "agd-lab-f-exclusion-attendue",
+      "complete": true,
+      "comment": "Seul objet produisant CorrectExclusion. requiredResourceAccess ne peut pas exprimer une attente negative, le manifeste si.",
+      "permissions": [
+        {
+          "value": "Directory.Read.All",
+          "expectedGranted": false,
+          "resourceAppId": "00000003-0000-0000-c000-000000000000"
+        }
+      ]
+    },
+    {
+      "appId": "79967421-7130-48d7-8b09-9900c99b1b73",
+      "displayName": "agd-lab-g-troncature",
+      "complete": true,
+      "comment": "25 attributions. Eprouve la limite documentee de 20 elements de $expand. Sans relecture individuelle, cinq lignes manquent sans signal."
+    },
+    {
+      "appId": "bc96b16d-24c8-48c0-9f8e-9333cf4c2134",
+      "displayName": "agd-lab-c-ressource",
+      "complete": true,
+      "comment": "Objet de support du lab, jamais client. Present pour que le manifeste reste exhaustif.",
+      "permissions": []
+    },
+    {
+      "appId": "4695bc55-0f1f-4210-a579-fae1dbaca5a5",
+      "displayName": "agd-lab-h-controle-negatif",
+      "complete": true,
+      "comment": "Objet de support du lab, jamais client. Present pour que le manifeste reste exhaustif.",
+      "permissions": []
+    }
+  ]
+}

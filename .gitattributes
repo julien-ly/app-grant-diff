@@ -1,0 +1,15 @@
+# Default handling: let Git normalize text files in the repository.
+* text=auto
+
+# The shipped report records the SHA256 of the manifest it ran against, and that
+# manifest is samples/lab-intent.json. Line-ending normalization would change its
+# bytes and break the check on any platform whose native ending differs from the
+# one it was written with. Stored verbatim, with no conversion in either direction.
+samples/lab-intent.json -text
+
+# Same reasoning for the report: it carries the hash it must agree with, and a
+# diff on it should reflect a different run, not a different platform.
+samples/output.json -text
+
+# samples/intent.json is a hand-written format example. Nothing hashes it, so it
+# follows normal text handling.

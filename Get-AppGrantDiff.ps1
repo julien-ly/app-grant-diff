@@ -1,0 +1,649 @@
+#Requires -Version 7.0
+#Requires -Modules Microsoft.Graph.Applications
+
+<#
+.SYNOPSIS
+    Compares the application permissions declared on an app registration against
+    the app role assignments actually granted to its service principal, and
+    reports the gap.
+
+.DESCRIPTION
+    This tool does not administer, modify, recommend or decide anything.
+    It establishes what a tenant declares, what it grants, and whether the two
+    agree. A gap is a state to examine, not a fault.
+
+    Three independent dimensions, reported separately.
+
+    Conclusion:
+      GapEstablished          At least one permission is under-covered or
+                              over-covered.
+      NoGapEstablished        Every principal is resolved, the manifest is
+                              complete, and every permission is in its expected
+                              state.
+      CoverageNotDemonstrable No gap is proven and the assessment could not
+                              cover the whole population.
+
+    Assessment completeness, a property of the manifest:
+      Complete   Manifest declared complete and fully resolved.
+      Partial    Manifest incomplete, entries unresolved, or grant holders that
+                 the reference does not allow judging. Reasons are listed and
+                 name the principals concerned.
+      Absent     No manifest provided.
+
+    Observation freshness, a property of the grant snapshot:
+      NotDemonstrated  Microsoft Graph documents replication delays on app role
+                       assignments and exposes no convergence indicator.
+
+    Freshness is never asserted as good. The tool has no way to establish that
+    the snapshot it read has converged, so it says so rather than implying it.
+
+    ENUMERATION AXIS: service principals, not app registrations.
+    Starting from registrations can never reach the principals that hold grants
+    without a local registration, and that is the population this tool exists to
+    make visible. A paginated $expand establishes which principals hold grants;
+    individual reads are then issued only where a zero carries a conclusion.
+
+    $EXPAND ESTABLISHES PRESENCE, NEVER COMPLETENESS.
+    For Entra resources deriving from directoryObject, $expand returns at most
+    20 items of the expanded relationship and no @odata.nextLink. Navigation
+    properties never carry an odata.count annotation either. A principal holding
+    more than 20 assignments is therefore silently under-reported, with nothing
+    in the payload to signal it. Every non-empty expanded collection is re-read
+    individually before use. See README, "The $expand limit".
+
+    ABSENCE OF A PROPERTY IS NOT ZERO.
+    $expand omits appRoleAssignments entirely for principals that hold none. A
+    principal whose grant state was not observed receives no evaluation row: it
+    degrades assessment completeness and raises a diagnostic.
+
+    Application permissions only. Delegated permissions are out of scope:
+    dynamic consent, consent type and multiple scopes in a single value make the
+    gap a normal state there and would produce false positives.
+
+.PARAMETER IntentPath
+    Optional. Path to an intent manifest. Without it, grants are reported as
+    Observed and the conclusion cannot exceed CoverageNotDemonstrable, because
+    requiredResourceAccess carries no exhaustiveness flag and over-coverage
+    cannot be established from tenant data alone. See README, "Intent manifest".
+
+.PARAMETER OutputPath
+    Optional. Path of the JSON report. Defaults to report.json in the current
+    directory.
+
+.PARAMETER PassThru
+    Emit the report object on the pipeline in addition to writing the file.
+
+.PARAMETER Quiet
+    Suppress the console summary. The file and -PassThru are unaffected.
+
+.EXAMPLE
+    Connect-MgGraph -Scopes 'Application.Read.All','Directory.Read.All'
+    .\Get-AppGrantDiff.ps1
+
+.EXAMPLE
+    .\Get-AppGrantDiff.ps1 -IntentPath .\samples\intent.json -OutputPath .\report.json
+
+.NOTES
+    Read-only. Requires Application.Read.All and Directory.Read.All.
+    MIT. https://github.com/julien-ly/app-grant-diff
+#>
+
+[CmdletBinding()]
+param(
+    [string] $IntentPath,
+    [string] $OutputPath,
+    [switch] $PassThru,
+    [switch] $Quiet
+)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+$ToolVersion  = '1.0.0'
+$NullRoleId   = '00000000-0000-0000-0000-000000000000'
+
+if (-not $OutputPath) { $OutputPath = Join-Path (Get-Location) 'report.json' }
+
+function Write-Line { param([string]$Text) if (-not $Quiet) { Write-Host $Text } }
+
+# ── Session ─────────────────────────────────────────────────────────────────
+
+# Mixed SDK versions fail with an assembly load error that names the assembly
+# and not the cause. Say the cause here rather than leave it to the README.
+$authLoaded = @(Get-Module Microsoft.Graph.Authentication)
+if ($authLoaded.Count -gt 1) {
+    throw "Several versions of Microsoft.Graph.Authentication are loaded ($(($authLoaded.Version) -join ', ')). An assembly cannot be unloaded from a running process: start a new one, and install the SDK submodules at a single matching version."
+}
+if ($authLoaded.Count -eq 1) {
+    $appsLoaded = @(Get-Module Microsoft.Graph.Applications)
+    if ($appsLoaded.Count -eq 1 -and $appsLoaded[0].Version -ne $authLoaded[0].Version) {
+        Write-Warning "Microsoft.Graph.Authentication $($authLoaded[0].Version) and Microsoft.Graph.Applications $($appsLoaded[0].Version) are loaded at different versions. If a call fails on an assembly conflict, this is the cause."
+    }
+}
+
+$context = Get-MgContext
+if (-not $context) {
+    throw "Not connected. Run: Connect-MgGraph -Scopes 'Application.Read.All','Directory.Read.All'"
+}
+$tenantId = $context.TenantId
+Write-Line "Tenant : $tenantId"
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+function Get-Field {
+    # Invoke-MgGraphRequest may return hashtables or PSObjects depending on the
+    # SDK version. Dot access works on both, Select-Object only on the second.
+    # Read explicitly rather than assume the shape.
+    param($Item, [string]$Name)
+    if ($null -eq $Item) { return $null }
+    if ($Item -is [System.Collections.IDictionary]) {
+        if ($Item.Contains($Name)) { return $Item[$Name] }
+        return $null
+    }
+    $p = $Item.PSObject.Properties[$Name]
+    if ($p) { return $p.Value }
+    return $null
+}
+
+$diagnostics = [System.Collections.Generic.List[object]]::new()
+function Add-Diagnostic {
+    param([string]$Severity, [string]$Code, [string]$Object, [string]$Message)
+    $diagnostics.Add([pscustomobject]@{
+        severity = $Severity; code = $Code; object = $Object; message = $Message
+    })
+}
+
+# ── 1. Intent manifest ──────────────────────────────────────────────────────
+#    Contract validation. An evidence tool does not infer its own reference.
+
+$intentStatus      = 'Absent'
+$intentComplete    = $false
+$intentDescription = $null
+$intentAsOf        = $null
+$intentHash        = $null
+$intentDeclared    = 0
+$intentNotResolved = 0
+$intentDuplicates  = 0
+$intentByAppId     = @{}
+
+if ($IntentPath) {
+    if (-not (Test-Path -LiteralPath $IntentPath)) {
+        # Echo back the resolved path and the working directory. A relative path
+        # repeated verbatim tells the reader nothing they did not already type.
+        $resolved = [System.IO.Path]::GetFullPath($IntentPath, (Get-Location).Path)
+        throw "Intent manifest not found. Given: $IntentPath. Resolved to: $resolved. Working directory: $((Get-Location).Path)."
+    }
+
+    $intentHash = (Get-FileHash -LiteralPath $IntentPath -Algorithm SHA256).Hash
+    $raw = Get-Content -LiteralPath $IntentPath -Raw -Encoding utf8 | ConvertFrom-Json
+
+    if ($null -eq $raw.PSObject.Properties['complete']) {
+        throw "The manifest carries no 'complete' field. It is mandatory and never inferred."
+    }
+    $intentComplete    = [bool]$raw.complete
+    $intentStatus      = 'Available'
+    $intentDescription = if ($raw.PSObject.Properties['description']) { $raw.description } else { $null }
+    $intentAsOf        = if ($raw.PSObject.Properties['asOf']) { $raw.asOf } else { $null }
+
+    foreach ($p in @($raw.principals)) {
+        $intentDeclared++
+        $label = if ($p.PSObject.Properties['displayName']) { $p.displayName } else { $p.appId }
+
+        if ($null -eq $p.PSObject.Properties['complete']) {
+            throw "Entry '$label' carries no 'complete' field. It is mandatory per principal."
+        }
+        if ($null -eq $p.PSObject.Properties['appId'] -or -not $p.appId) {
+            $intentNotResolved++
+            Add-Diagnostic 'Warning' 'IntentEntryNotResolved' $label 'The entry carries no usable appId.'
+            continue
+        }
+        if ($intentByAppId.ContainsKey($p.appId)) {
+            $intentDuplicates++
+            Add-Diagnostic 'Info' 'IntentEntryDuplicate' $label 'The principal appears more than once in the manifest.'
+            continue
+        }
+
+        $permissions = @()
+        if ($p.PSObject.Properties['permissions']) {
+            foreach ($q in @($p.permissions)) {
+                $permissions += [pscustomobject]@{
+                    ResourceAppId   = $q.resourceAppId
+                    Value           = $q.value
+                    ExpectedGranted = [bool]$q.expectedGranted
+                    Key             = "$($q.resourceAppId)/$($q.value)"
+                }
+            }
+        }
+
+        $intentByAppId[$p.appId] = [pscustomobject]@{
+            DisplayName         = $label
+            Complete            = [bool]$p.complete
+            Permissions         = @($permissions)
+            PermissionsProvided = [bool]$p.PSObject.Properties['permissions']
+        }
+    }
+    # Only file-level resolution is known at this point. Resolution against the
+    # tenant happens later; reporting it here would print a figure that a later
+    # line contradicts.
+    Write-Line "Manifest : $intentDeclared entries loaded, $($intentByAppId.Count) usable"
+} else {
+    Write-Line 'Manifest : none. The conclusion cannot exceed CoverageNotDemonstrable.'
+}
+
+# ── 2. Granted side: paginated $expand ──────────────────────────────────────
+
+Write-Line ''
+Write-Line 'Reading assignments'
+
+$grantsBySpId  = @{}   # spObjectId -> assignments, key absent when not observed
+$spBySpId      = @{}
+$spByAppId     = @{}
+$nestedSignals = @{}
+$expandCount   = @{}
+
+$uri = 'https://graph.microsoft.com/v1.0/servicePrincipals?$select=id,appId,displayName,appOwnerOrganizationId&$expand=appRoleAssignments'
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$pages = 0
+$next = $uri
+while ($next) {
+    $page = Invoke-MgGraphRequest -Method GET -Uri $next -OutputType PSObject
+    $pages++
+    foreach ($v in @(Get-Field -Item $page -Name 'value')) {
+        $id    = Get-Field -Item $v -Name 'id'
+        $appId = Get-Field -Item $v -Name 'appId'
+        $sp = [pscustomobject]@{
+            Id          = $id
+            AppId       = $appId
+            DisplayName = Get-Field -Item $v -Name 'displayName'
+            OwnerOrgId  = Get-Field -Item $v -Name 'appOwnerOrganizationId'
+        }
+        $spBySpId[$id] = $sp
+        if ($appId) { $spByAppId[$appId] = $sp }
+
+        $assignments = Get-Field -Item $v -Name 'appRoleAssignments'
+        if ($null -ne $assignments) {
+            $grantsBySpId[$id] = @(@($assignments) | ForEach-Object {
+                [pscustomobject]@{
+                    Id         = Get-Field -Item $_ -Name 'id'
+                    AppRoleId  = Get-Field -Item $_ -Name 'appRoleId'
+                    ResourceId = Get-Field -Item $_ -Name 'resourceId'
+                }
+            })
+            # Does Graph announce the rest of the nested collection? If it does,
+            # the truncation is signalled and the reader is at fault. If it does
+            # not, it is silent. The difference is observed, not assumed.
+            $nestedLink  = Get-Field -Item $v -Name 'appRoleAssignments@odata.nextLink'
+            $nestedCount = Get-Field -Item $v -Name 'appRoleAssignments@odata.count'
+            if ($nestedLink -or $nestedCount) {
+                $nestedSignals[$id] = [pscustomobject]@{ nextLink = $nestedLink; count = $nestedCount }
+            }
+        }
+    }
+    $next = Get-Field -Item $page -Name '@odata.nextLink'
+}
+$sw.Stop()
+Write-Line "$($spBySpId.Count) principals, $pages pages, $([math]::Round($sw.Elapsed.TotalSeconds,1)) s"
+Write-Line "$($grantsBySpId.Count) principals with the relationship rendered"
+
+# ── 3. Declared side: local app registrations ───────────────────────────────
+
+$declaredByAppId = @{}
+foreach ($app in @(Get-MgApplication -All -Property 'id,appId,displayName,requiredResourceAccess')) {
+    $declared = @()
+    foreach ($resource in @($app.RequiredResourceAccess)) {
+        foreach ($access in @($resource.ResourceAccess)) {
+            if ($access.Type -eq 'Role') {
+                $declared += [pscustomobject]@{ ResourceAppId = $resource.ResourceAppId; RoleId = $access.Id }
+            }
+        }
+    }
+    if ($declaredByAppId.ContainsKey($app.AppId)) {
+        Add-Diagnostic 'Warning' 'DuplicateApplication' $app.DisplayName 'Several local registrations carry the same appId.'
+        continue
+    }
+    $declaredByAppId[$app.AppId] = [pscustomobject]@{
+        ObjectId = $app.Id; DisplayName = $app.DisplayName; Declared = @($declared)
+    }
+}
+Write-Line "$($declaredByAppId.Count) local registrations"
+
+# ── 4. Scope, and targeted individual reads ─────────────────────────────────
+
+$scope = [System.Collections.Generic.HashSet[string]]::new()
+foreach ($id in $grantsBySpId.Keys) { if (@($grantsBySpId[$id]).Count -gt 0) { [void]$scope.Add($id) } }
+foreach ($appId in $declaredByAppId.Keys) {
+    if ($declaredByAppId[$appId].Declared.Count -gt 0 -and $spByAppId.ContainsKey($appId)) {
+        [void]$scope.Add($spByAppId[$appId].Id)
+    }
+}
+foreach ($appId in $intentByAppId.Keys) {
+    if ($spByAppId.ContainsKey($appId)) { [void]$scope.Add($spByAppId[$appId].Id) }
+    else {
+        # An entry that names a principal absent from the tenant is unresolved,
+        # exactly like one that carries no usable appId. It must degrade
+        # over-coverage demonstrability: a manifest claiming exhaustiveness
+        # while pointing at something that does not exist is not fully resolved.
+        $intentNotResolved++
+        Add-Diagnostic 'Warning' 'IntentPrincipalAbsent' $intentByAppId[$appId].DisplayName 'The manifest principal does not exist in the tenant. Counted as unresolved.'
+    }
+}
+
+$zeroConfirmingReads = 0
+$completenessReads   = 0
+$truncated           = 0
+$notObserved = [System.Collections.Generic.List[string]]::new()
+
+foreach ($id in @($scope)) {
+
+    $alreadyRendered = $grantsBySpId.ContainsKey($id)
+    if ($alreadyRendered) {
+        $expandCount[$id] = @($grantsBySpId[$id]).Count
+        if ($expandCount[$id] -eq 0) { continue }
+        $completenessReads++
+    } else {
+        $zeroConfirmingReads++
+    }
+
+    try {
+        $full = @(@(Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $id -All) | ForEach-Object {
+            [pscustomobject]@{ Id = $_.Id; AppRoleId = $_.AppRoleId; ResourceId = $_.ResourceId }
+        })
+
+        if ($alreadyRendered -and $full.Count -ne $expandCount[$id]) {
+            $truncated++
+            $signalled = $nestedSignals.ContainsKey($id)
+            Add-Diagnostic 'Warning' 'ExpandCollectionTruncated' $spBySpId[$id].DisplayName `
+                ("`$expand returned $($expandCount[$id]) assignments out of $($full.Count) actual. " +
+                 $(if ($signalled) { "Graph announced the rest: $($nestedSignals[$id] | ConvertTo-Json -Compress)." }
+                   else { 'No continuation link and no announced count in the payload. Documented behaviour: $expand returns at most 20 items for an expanded relationship on a directoryObject-derived resource, with no @odata.nextLink. See learn.microsoft.com/graph/query-parameters#expand.' }))
+        }
+
+        $grantsBySpId[$id] = $full
+    } catch {
+        if ($alreadyRendered) {
+            Add-Diagnostic 'Warning' 'CompletenessNotVerified' $spBySpId[$id].DisplayName `
+                "Re-read failed, the `$expand result could not be verified: $($_.Exception.Message)"
+        } else {
+            $notObserved.Add($id)
+            Add-Diagnostic 'Error' 'GrantStateNotObserved' $spBySpId[$id].DisplayName `
+                "Assignments could not be read: $($_.Exception.Message)"
+        }
+    }
+}
+Write-Line "$($scope.Count) principals in scope"
+Write-Line "$zeroConfirmingReads reads to confirm a zero, $completenessReads to verify completeness"
+if ($truncated -gt 0 -and -not $Quiet) { Write-Warning "$truncated `$expand collection(s) truncated." }
+
+# ── 5. Role name resolution ─────────────────────────────────────────────────
+
+$rolesByAppId = @{}
+function Get-RoleValue {
+    param([string]$ResourceAppId, [string]$RoleId)
+    if ($RoleId -eq $NullRoleId) { return '(assigned without a specific role)' }
+    if (-not $rolesByAppId.ContainsKey($ResourceAppId)) {
+        $found = @(Get-MgServicePrincipal -Filter "appId eq '$ResourceAppId'" -Property 'id,appId,displayName,appRoles')
+        $rolesByAppId[$ResourceAppId] = if ($found.Count -eq 1) { $found[0] } else { $null }
+    }
+    $sp = $rolesByAppId[$ResourceAppId]
+    if (-not $sp) { return "(role $RoleId on resource $ResourceAppId absent from the tenant)" }
+    $match = @($sp.AppRoles | Where-Object { $_.Id -eq $RoleId })
+    if ($match.Count -eq 0) { return "(role $RoleId not exposed by $($sp.DisplayName))" }
+    $match[0].Value
+}
+
+function Get-ResourceAppId {
+    param([string]$ResourceSpId)
+    if (-not $spBySpId.ContainsKey($ResourceSpId)) { return "(sp $ResourceSpId unknown)" }
+    $spBySpId[$ResourceSpId].AppId
+}
+
+# ── 6. Evaluation matrix ────────────────────────────────────────────────────
+
+$evaluation          = [System.Collections.Generic.List[object]]::new()
+$completenessReasons = [System.Collections.Generic.List[string]]::new()
+$notJudgeable        = [System.Collections.Generic.List[string]]::new()
+
+if ($intentStatus -eq 'Absent')                              { $completenessReasons.Add('No intent manifest was provided.') }
+if ($intentStatus -eq 'Available' -and -not $intentComplete) { $completenessReasons.Add('The manifest declares itself not complete.') }
+if ($intentNotResolved -gt 0)                                { $completenessReasons.Add("$intentNotResolved manifest entries could not be resolved.") }
+
+foreach ($spId in @($scope)) {
+    $sp = $spBySpId[$spId]
+    $appId = $sp.AppId
+
+    if ($notObserved.Contains($spId)) {
+        $completenessReasons.Add("The grant state of '$($sp.DisplayName)' was not observed.")
+        continue
+    }
+
+    $entry        = if ($appId -and $intentByAppId.ContainsKey($appId))   { $intentByAppId[$appId] }   else { $null }
+    $registration = if ($appId -and $declaredByAppId.ContainsKey($appId)) { $declaredByAppId[$appId] } else { $null }
+
+    # requiredResourceAccess is a POSITIVE-ONLY declaration. It has no way to
+    # express "explicitly not expected": the absence of an entry there means
+    # "not declared", not "excluded". A negative expectation can therefore only
+    # come from the manifest, including for a principal that has a registration.
+    # Without this rule CorrectExclusion is unreachable as soon as a
+    # registration exists, and the state is never produced.
+
+    $expected         = @{}
+    $declaredPositive = @{}
+
+    if ($registration) {
+        foreach ($d in $registration.Declared) {
+            $value = Get-RoleValue $d.ResourceAppId $d.RoleId
+            $declaredPositive["$($d.ResourceAppId)/$value"] = $true
+            $expected["$($d.ResourceAppId)/$value"] = $true
+        }
+    }
+
+    if ($entry -and $entry.PermissionsProvided) {
+        foreach ($p in $entry.Permissions) {
+            if (-not $registration) {
+                $expected[$p.Key] = $p.ExpectedGranted
+            }
+            elseif (-not $p.ExpectedGranted) {
+                if ($declaredPositive.ContainsKey($p.Key)) {
+                    Add-Diagnostic 'Warning' 'ManifestDeclarationMismatch' $sp.DisplayName `
+                        "The manifest declares '$($p.Key)' explicitly not expected while the registration declares it. The registration prevails; the contradiction is reported."
+                } else {
+                    $expected[$p.Key] = $false
+                }
+            }
+        }
+
+        if ($registration) {
+            $manifestPositive = @{}
+            foreach ($p in $entry.Permissions) { if ($p.ExpectedGranted) { $manifestPositive[$p.Key] = $true } }
+            if ($manifestPositive.Count -gt 0) {
+                $registrationOnly = @($declaredPositive.Keys | Where-Object { -not $manifestPositive.ContainsKey($_) })
+                $manifestOnly     = @($manifestPositive.Keys | Where-Object { -not $declaredPositive.ContainsKey($_) })
+                if ($registrationOnly.Count -gt 0 -or $manifestOnly.Count -gt 0) {
+                    Add-Diagnostic 'Warning' 'ManifestDeclarationMismatch' $sp.DisplayName `
+                        ("Manifest and requiredResourceAccess diverge on positive expectations. Registration only: $($registrationOnly -join ', '). Manifest only: $($manifestOnly -join ', ').")
+                }
+            }
+        }
+    }
+
+    $observed = @{}
+    foreach ($g in @($grantsBySpId[$spId])) {
+        $resourceAppId = Get-ResourceAppId $g.ResourceId
+        $value = Get-RoleValue $resourceAppId $g.AppRoleId
+        $observed["$resourceAppId/$value"] = $true
+    }
+
+    # Over-coverage is demonstrable only when an exhaustive reference exists for
+    # THIS principal. Without a manifest, without an entry, or with an entry that
+    # does not claim to be exhaustive, an unmatched grant stays NotInManifest, or
+    # Observed when there is no manifest at all.
+    $overDemonstrable = ($intentStatus -eq 'Available') -and $entry -and $entry.Complete -and ($intentNotResolved -eq 0)
+
+    $producedNotInManifest = $false
+
+    foreach ($key in @(@($expected.Keys) + @($observed.Keys) | Select-Object -Unique)) {
+        $exp = if ($expected.ContainsKey($key)) { [bool]$expected[$key] } else { $null }
+        $obs = $observed.ContainsKey($key)
+
+        $state =
+            if     ($exp -eq $true  -and $obs)      { 'CorrectCoverage' }
+            elseif ($exp -eq $true  -and -not $obs) { 'UnderCoverage' }
+            elseif ($exp -eq $false -and -not $obs) { 'CorrectExclusion' }
+            elseif ($exp -eq $false -and $obs)      { if ($overDemonstrable) { 'OverCoverage' } else { 'NotInManifest' } }
+            elseif ($intentStatus -eq 'Absent')     { 'Observed' }
+            elseif ($overDemonstrable)              { 'OverCoverage' }
+            else                                    { 'NotInManifest' }
+
+        if ($state -eq 'NotInManifest') { $producedNotInManifest = $true }
+
+        $parts = $key -split '/', 2
+        $evaluation.Add([pscustomobject]@{
+            principalId       = $spId
+            principalAppId    = $appId
+            displayName       = $sp.DisplayName
+            resourceAppId     = $parts[0]
+            permission        = $parts[1]
+            expectedGranted   = $exp
+            observedGranted   = $obs
+            state             = $state
+            source            = if ($null -eq $exp) { 'grant' } elseif ($registration) { 'registration' } else { 'intent' }
+            localRegistration = [bool]$registration
+        })
+    }
+
+    # Name a principal only when it actually produced an unjudgeable row. A
+    # degraded reference does not make every grant holder unjudged: a principal
+    # whose every assignment matches a declaration is judged CorrectCoverage,
+    # and listing it here would overstate what the sentence describes.
+    if ($intentStatus -eq 'Available' -and $producedNotInManifest) {
+        $notJudgeable.Add($sp.DisplayName)
+        if ($intentComplete -and -not $entry) {
+            Add-Diagnostic 'Warning' 'ManifestClaimsCompleteButOmitsGrantHolder' $sp.DisplayName `
+                'The manifest declares itself complete and does not contain this principal, which holds assignments. The exhaustiveness claim is contradicted by the tenant.'
+        }
+    }
+}
+
+# ── 7. Three axes ───────────────────────────────────────────────────────────
+
+$states = @('CorrectCoverage','CorrectExclusion','UnderCoverage','OverCoverage','NotInManifest','Observed')
+$counts = [ordered]@{}
+foreach ($s in $states) { $counts[$s] = @($evaluation | Where-Object { $_.state -eq $s }).Count }
+
+# NotResolved is not a row state: unresolved entries produce no row at all.
+# It is carried in summary anyway, because summary is where a reader counts what
+# happened. Without it the totals read as full coverage while some entries were
+# never evaluated. Rows that do not exist belong in the same table as rows that do.
+$counts['NotResolved'] = $intentNotResolved
+
+if ($notJudgeable.Count -gt 0) {
+    $names = @($notJudgeable | Sort-Object -Unique)
+    $excerpt = if ($names.Count -le 5) { $names -join ', ' } else { (@($names)[0..4] -join ', ') + ", and $($names.Count - 5) more" }
+    $completenessReasons.Add("$($names.Count) principal(s) hold assignments the reference does not allow judging: $excerpt.")
+}
+
+$reasons = @($completenessReasons | Select-Object -Unique)
+$completeness = if     ($intentStatus -eq 'Absent') { 'Absent' }
+                elseif ($reasons.Count -gt 0)       { 'Partial' }
+                else                                { 'Complete' }
+
+$observation = [pscustomobject]@{
+    replicationIndicator = 'NotExposed'
+    expandCompleteness   = if ($truncated -gt 0) { 'TruncatedAndRepaired' } else { 'NotContradicted' }
+    freshness            = 'NotDemonstrated'
+    note                 = 'Microsoft Graph documents replication delays on app role assignments and exposes no convergence indicator. That the snapshot read is current has not been established.'
+}
+
+$hasGap = ($counts['UnderCoverage'] -gt 0) -or ($counts['OverCoverage'] -gt 0)
+
+$conclusion =
+    if ($hasGap) {
+        $parts = @()
+        if ($counts['UnderCoverage'] -gt 0) { $parts += "$($counts['UnderCoverage']) permission(s) declared and not granted" }
+        if ($counts['OverCoverage']  -gt 0) { $parts += "$($counts['OverCoverage']) permission(s) granted and not expected" }
+        [pscustomobject]@{
+            result            = 'GapEstablished'
+            detail            = ($parts -join '. ') + '.'
+            gapBreakCondition = 'The manifest is out of date or wrong about what is expected for these principals, or the assignment snapshot was not current when the report was generated.'
+            impactBoundary    = 'Delegated permissions, user consent, directory role membership and managed identities are not evaluated. A gap here does not establish what the principal actually accesses.'
+        }
+    }
+    elseif ($completeness -ne 'Complete') {
+        [pscustomobject]@{
+            result            = 'CoverageNotDemonstrable'
+            detail            = 'No gap was established, and the assessment could not cover the whole population. ' + ($reasons -join ' ')
+            gapBreakCondition = $null
+            impactBoundary    = $null
+        }
+    }
+    else {
+        [pscustomobject]@{
+            result            = 'NoGapEstablished'
+            detail            = 'No gap observed. The manifest was complete and fully resolved. The freshness of the assignments was not independently established.'
+            gapBreakCondition = 'The manifest is out of date, or it claims exhaustiveness while omitting part of the real population, or the assignments had not finished converging when read.'
+            impactBoundary    = $null
+        }
+    }
+
+# ── 8. Report ───────────────────────────────────────────────────────────────
+
+$report = [pscustomobject]@{
+    metadata = [pscustomobject]@{
+        toolVersion       = $ToolVersion
+        generatedAt       = (Get-Date).ToUniversalTime().ToString('o')
+        powerShellVersion = $PSVersionTable.PSVersion.ToString()
+        tenantId          = $tenantId
+        disclaimer        = 'Conclusions are bounded to application permissions. Delegated permissions are not evaluated.'
+    }
+    intentSource = [pscustomobject]@{
+        status              = $intentStatus
+        path                = $IntentPath
+        description         = $intentDescription
+        asOf                = $intentAsOf
+        sha256              = $intentHash
+        complete            = if ($intentStatus -eq 'Available') { $intentComplete } else { $null }
+        declaredObjectCount = $intentDeclared
+        resolvedObjectCount = $intentByAppId.Count
+        notResolved         = $intentNotResolved
+        duplicatesIgnored   = $intentDuplicates
+    }
+    read = [pscustomobject]@{
+        principalsTotal          = $spBySpId.Count
+        expandPages              = $pages
+        expandDurationMs         = $sw.ElapsedMilliseconds
+        relationRendered         = $expandCount.Count
+        scopedPrincipals         = $scope.Count
+        zeroConfirmingReads      = $zeroConfirmingReads
+        completenessReads        = $completenessReads
+        expandTruncated          = $truncated
+        grantStateNotObserved    = $notObserved.Count
+        grantHoldersNotJudgeable = @($notJudgeable | Sort-Object -Unique).Count
+    }
+    evaluation  = $evaluation.ToArray()
+    summary     = [pscustomobject]$counts
+    assessment  = [pscustomobject]@{ completeness = $completeness; reasons = $reasons }
+    observation = $observation
+    conclusion  = $conclusion
+    diagnostics = $diagnostics.ToArray()
+}
+
+$report | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $OutputPath -Encoding utf8
+
+if (-not $Quiet) {
+    Write-Host ''
+    $evaluation | Format-Table displayName, permission, expectedGranted, observedGranted, state -AutoSize
+    Write-Host "completeness : $completeness"
+    foreach ($r in $reasons) { Write-Host "  - $r" }
+    Write-Host "freshness    : $($observation.freshness)"
+    Write-Host "conclusion   : $($conclusion.result)"
+    Write-Host "               $($conclusion.detail)"
+    if ($diagnostics.Count -gt 0) {
+        Write-Host ''
+        Write-Host 'Diagnostics:'
+        $diagnostics | Format-Table severity, code, object, message -AutoSize -Wrap
+    }
+    Write-Host ''
+    Write-Host "Report : $OutputPath"
+}
+
+if ($PassThru) { $report }
