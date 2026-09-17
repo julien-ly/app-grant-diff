@@ -431,6 +431,18 @@ if ($intentStatus -eq 'Absent')                      { $completenessReasons.Add(
 if ($intentStatus -eq 'Available' -and -not $intentComplete) { $completenessReasons.Add('Le manifeste se declare non exhaustif.') }
 if ($intentNotResolved -gt 0)                        { $completenessReasons.Add("$intentNotResolved entree(s) du manifeste n'ont pas pu etre resolues.") }
 
+# Une entree qui declare complete:false dit que la reference est incomplete pour
+# ce principal, et elle le dit qu'il produise une ligne ou non. Ne le deduire que
+# des lignes emises laisse un manifeste dont une entree renonce a l'exhaustivite
+# sortir en Complete, faute de ligne pour objecter.
+$nonExhaustives = @($intentParAppId.Values | Where-Object { -not $_.Complete } |
+                    ForEach-Object { $_.DisplayName } | Sort-Object)
+if ($nonExhaustives.Count -gt 0) {
+    $extrait = if ($nonExhaustives.Count -le 5) { $nonExhaustives -join ', ' }
+               else { (@($nonExhaustives)[0..4] -join ', ') + ", et $($nonExhaustives.Count - 5) autre(s)" }
+    $completenessReasons.Add("$($nonExhaustives.Count) entree(s) du manifeste ne revendiquent pas l'exhaustivite : $extrait.")
+}
+
 foreach ($spId in @($perimetre)) {
     $sp = $spParSpId[$spId]
     $appId = $sp.AppId

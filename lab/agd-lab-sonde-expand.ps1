@@ -242,24 +242,44 @@ if (-not $formeRetenue) {
     }
     $lignes = @($lignes)
 
-    $ecarts = @($lignes | Where-Object { $_.verdict -like 'ECART*' })
+    $ecarts  = @($lignes | Where-Object { $_.verdict -like 'ECART*' })
     $absents = @($lignes | Where-Object { $_.verdict -eq 'expand_non_observable' })
+    # La reference aussi peut manquer. Ne qualifier qu'un cote de la
+    # comparaison laisse l'autre hors du verdict.
+    $refAbsente = @($lignes | Where-Object { $_.verdict -eq 'reference_non_observable' })
 
-    Add-Observation 'sonde' 'confrontation_total'   $lignes.Count
-    Add-Observation 'sonde' 'confrontation_ecarts'  $ecarts.Count
-    Add-Observation 'sonde' 'confrontation_absents' $absents.Count
+    Add-Observation 'sonde' 'confrontation_total'      $lignes.Count
+    Add-Observation 'sonde' 'confrontation_ecarts'     $ecarts.Count
+    Add-Observation 'sonde' 'confrontation_absents'    $absents.Count
+    Add-Observation 'sonde' 'confrontation_ref_absente' $refAbsente.Count
     foreach ($e in $ecarts) { Add-Observation 'sonde' 'ecart_expand' $e }
 
     $lignes | Where-Object { $_.verdict -ne 'concordant' -or $_.reference_compte -ne 0 } |
         Format-Table nom, reference_compte, expand_compte, verdict -AutoSize
 
-    if ($ecarts.Count -eq 0 -and $absents.Count -eq 0) {
+    # Trois verdicts, pas deux. Un ecart etabli et une couverture partielle sont
+    # deux faits differents, et les confondre fait lire "divergent" sur un
+    # resultat de zero ecart. La distinction est celle qu'on exige du moteur :
+    # une comparaison partielle sans ecart etabli n'est ni une divergence ni une
+    # concordance complete.
+    $nonCouverts = $absents.Count + $refAbsente.Count
+
+    if ($ecarts.Count -gt 0) {
+        Add-Observation 'sonde' 'conclusion' 'expand_divergent'
+        Add-Observation 'sonde' 'conclusion_detail' "$($ecarts.Count) ecart(s) de contenu ou de compte entre `$expand et la lecture individuelle."
+        Write-Warning "$($ecarts.Count) ecart(s) etabli(s). $nonCouverts principal(aux) non couvert(s) par ailleurs."
+    }
+    elseif ($nonCouverts -gt 0) {
+        Add-Observation 'sonde' 'conclusion' 'expand_non_contredit_couverture_partielle'
+        Add-Observation 'sonde' 'conclusion_detail' "Aucun ecart etabli. $($absents.Count) principal(aux) sans relation rendue par `$expand, $($refAbsente.Count) sans reference lisible : la comparaison n'a pas porte sur eux."
+        Write-Host "Aucun ecart etabli, couverture partielle."
+        Write-Host "  $($absents.Count) sans relation rendue par `$expand, $($refAbsente.Count) sans reference lisible."
+        Write-Host "  Ce n'est ni une divergence ni une concordance complete."
+    }
+    else {
         Add-Observation 'sonde' 'conclusion' 'expand_concordant_sur_ce_tenant'
         Write-Host "Concordance complete sur ce tenant."
         Write-Host "Portee : aucun principal n'y porte assez d'attributions pour eprouver un plafond."
-    } else {
-        Add-Observation 'sonde' 'conclusion' 'expand_divergent'
-        Write-Warning "$($ecarts.Count) ecart(s), $($absents.Count) principal(aux) absent(s) du resultat `$expand."
     }
 
     $confPath = Join-Path $OutputDir 'agd-lab-sonde-expand.csv'

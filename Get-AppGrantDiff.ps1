@@ -471,6 +471,18 @@ if ($intentStatus -eq 'Absent')                              { $completenessReas
 if ($intentStatus -eq 'Available' -and -not $intentComplete) { $completenessReasons.Add('The manifest declares itself not complete.') }
 if ($intentNotResolved -gt 0)                                { $completenessReasons.Add("$intentNotResolved manifest entries could not be resolved.") }
 
+# An entry that declares complete:false says the reference is incomplete for
+# that principal, and it says so whether or not the principal produced a row.
+# Deriving this only from emitted rows lets a manifest whose own entry disclaims
+# exhaustiveness be reported as Complete, because nothing was emitted to object.
+$notExhaustive = @($intentByAppId.Values | Where-Object { -not $_.Complete } |
+                   ForEach-Object { $_.DisplayName } | Sort-Object)
+if ($notExhaustive.Count -gt 0) {
+    $excerpt = if ($notExhaustive.Count -le 5) { $notExhaustive -join ', ' }
+               else { (@($notExhaustive)[0..4] -join ', ') + ", and $($notExhaustive.Count - 5) more" }
+    $completenessReasons.Add("$($notExhaustive.Count) manifest entries do not claim to be exhaustive: $excerpt.")
+}
+
 foreach ($spId in @($scope)) {
     $sp = $spBySpId[$spId]
     $appId = $sp.AppId
