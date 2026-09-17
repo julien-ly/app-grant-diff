@@ -566,6 +566,8 @@ if ($nonJugeables.Count -gt 0) {
     $completenessReasons.Add("$($noms.Count) principal(aux) portent des attributions que la reference ne permet pas de juger : $extrait.")
 }
 
+$hasGap = ($perPermission['UnderCoverage'] -gt 0) -or ($perPermission['OverCoverage'] -gt 0)
+
 $reasons = @($completenessReasons | Select-Object -Unique)
 $completeness = if ($intentStatus -eq 'Absent') { 'Absent' }
                 elseif ($reasons.Count -gt 0)   { 'Partial' }
@@ -700,3 +702,4 @@ if (Test-Path -LiteralPath $RegistrePath) {
 }
 
 Write-Host "`nRapport : $jsonPath"
+
