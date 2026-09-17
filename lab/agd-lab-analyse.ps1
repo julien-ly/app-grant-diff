@@ -92,10 +92,15 @@ function Get-SignatureEntree {
 
 $diagnostics = [System.Collections.Generic.List[object]]::new()
 function Add-Diagnostic {
-    param([string]$Severity, [string]$Code, [string]$Object, [string]$Message)
-    $diagnostics.Add([pscustomobject]@{
+    # details porte les faits structures. Une phrase de 400 signes n'est pas un
+    # enregistrement : un consommateur devrait decouper de la prose pour
+    # retrouver des identifiants que le moteur detenait separes.
+    param([string]$Severity, [string]$Code, [string]$Object, [string]$Message, $Details)
+    $entree = [ordered]@{
         severity = $Severity; code = $Code; object = $Object; message = $Message
-    })
+    }
+    if ($null -ne $Details) { $entree['details'] = $Details }
+    $diagnostics.Add([pscustomobject]$entree)
 }
 
 # ── 1. Manifeste d'intention ────────────────────────────────────────────────
@@ -438,9 +443,15 @@ foreach ($id in @($perimetre)) {
             catch { "(appRoleId $($m.AppRoleId) sur ressource $($m.ResourceId))" }
         }
         Add-Diagnostic 'Warning' 'ExpandReadsDisagree' $spParSpId[$id].DisplayName `
-            ("La collection developpee portait $($expandCompte[$id]) attribution(s), la relecture $($complet.Count). " +
-             "$($ajoutes.Count) presente(s) seulement dans la relecture, $($retires.Count) seulement dans l'expansion. " +
-             "La cause n'est pas etablie : une expansion plafonnee et un changement entre les deux lectures produisent la meme difference. La relecture est retenue comme observation la plus recente.")
+            "Les deux lectures divergent : $($expandCompte[$id]) developpees, $($complet.Count) a la relecture." `
+            ([ordered]@{
+                expanded             = $expandCompte[$id]
+                actual               = $complet.Count
+                onlyInReRead         = @($libelles)
+                onlyInExpansionCount = $retires.Count
+                causeEstablished     = $false
+                note                 = 'Une expansion plafonnee et un changement entre les deux lectures produisent la meme difference. La relecture est retenue comme observation la plus recente.'
+            })
     }
 
     if ($etaitTronquee) {
@@ -458,10 +469,16 @@ foreach ($id in @($perimetre)) {
         }
         $manquantes = @($manquantes)
         Add-Diagnostic 'Warning' 'ExpandCollectionTruncated' $spParSpId[$id].DisplayName `
-            ("`$expand a rendu $($expandCompte[$id]) attribution(s) sur $($complet.Count) reelles. " +
-             "Manquantes : $($manquantes -join ', '). " +
-             $(if ($signale) { "Graph a signale la suite : $($signauxImbriques[$id] | ConvertTo-Json -Compress)." }
-               else { "Aucun lien de continuation ni compte annonce dans la charge utile. Comportement documente : `$expand rend typiquement au maximum 20 elements pour une relation developpee sur une ressource derivant de directoryObject, sans @odata.nextLink. Voir learn.microsoft.com/graph/query-parameters#expand." }))
+            "`$expand a rendu $($expandCompte[$id]) attribution(s) sur $($complet.Count) reelles." `
+            ([ordered]@{
+                expanded      = $expandCompte[$id]
+                actual        = $complet.Count
+                missing       = @($manquantes)
+                payloadSignal = if ($signale) { $signauxImbriques[$id] }
+                                else { 'Aucun lien de continuation ni compte annonce.' }
+                documented    = 'Au maximum 20 elements sont rendus pour une relation developpee sur une ressource derivant de directoryObject, sans @odata.nextLink.'
+                reference     = 'https://learn.microsoft.com/graph/query-parameters#expand'
+            })
     }
 }
 

@@ -155,10 +155,16 @@ function Get-EntrySignature {
 
 $diagnostics = [System.Collections.Generic.List[object]]::new()
 function Add-Diagnostic {
-    param([string]$Severity, [string]$Code, [string]$Object, [string]$Message)
-    $diagnostics.Add([pscustomobject]@{
+    # details carries the structured facts. A 400-character sentence is not a
+    # record: a consumer would have to split prose to recover identifiers the
+    # engine held separately, and a reader has to scroll a single JSON line to
+    # reach what the message promised.
+    param([string]$Severity, [string]$Code, [string]$Object, [string]$Message, $Details)
+    $entry = [ordered]@{
         severity = $Severity; code = $Code; object = $Object; message = $Message
-    })
+    }
+    if ($null -ne $Details) { $entry['details'] = $Details }
+    $diagnostics.Add([pscustomobject]$entry)
 }
 
 # ── 1. Intent manifest ──────────────────────────────────────────────────────
@@ -479,9 +485,15 @@ foreach ($id in @($scope)) {
             catch { "(appRoleId $($m.AppRoleId) on resource $($m.ResourceId))" }
         }
         Add-Diagnostic 'Warning' 'ExpandReadsDisagree' $spBySpId[$id].DisplayName `
-            ("The expanded collection held $($expandCount[$id]) assignments, the individual re-read $($full.Count). " +
-             "$($added.Count) present only in the re-read$(if (@($labels).Count -gt 0) { ": $(@($labels) -join ', ')" }), $($removed.Count) only in the expansion. " +
-             'The cause is not established: a capped expansion and a change between the two reads produce the same difference. The re-read is retained as the later observation.')
+            "The two reads disagree: $($expandCount[$id]) assignments expanded, $($full.Count) on re-read." `
+            ([ordered]@{
+                expanded             = $expandCount[$id]
+                actual               = $full.Count
+                onlyInReRead         = @($labels)
+                onlyInExpansionCount = $removed.Count
+                causeEstablished     = $false
+                note                 = 'A capped expansion and a change between the two reads produce the same difference. The re-read is retained as the later observation.'
+            })
     }
 
     if ($wasTruncated) {
@@ -499,10 +511,16 @@ foreach ($id in @($scope)) {
         }
         $missing = @($missing)
         Add-Diagnostic 'Warning' 'ExpandCollectionTruncated' $spBySpId[$id].DisplayName `
-            ("`$expand returned $($expandCount[$id]) assignments out of $($full.Count) actual. " +
-             "Missing: $($missing -join ', '). " +
-             $(if ($signalled) { "Graph announced the rest: $($nestedSignals[$id] | ConvertTo-Json -Compress)." }
-               else { 'No continuation link and no announced count in the payload. Documented behaviour: $expand returns at most 20 items for an expanded relationship on a directoryObject-derived resource, with no @odata.nextLink. See learn.microsoft.com/graph/query-parameters#expand.' }))
+            "`$expand returned $($expandCount[$id]) assignments out of $($full.Count) actual." `
+            ([ordered]@{
+                expanded      = $expandCount[$id]
+                actual        = $full.Count
+                missing       = @($missing)
+                payloadSignal = if ($signalled) { $nestedSignals[$id] }
+                                else { 'No continuation link and no announced count.' }
+                documented    = 'At most 20 items are returned for an expanded relationship on a directoryObject-derived resource, with no @odata.nextLink.'
+                reference     = 'https://learn.microsoft.com/graph/query-parameters#expand'
+            })
     }
 }
 Write-Line "$($scope.Count) principals in scope"

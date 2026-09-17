@@ -1,7 +1,7 @@
 {
   "metadata": {
     "toolVersion": "1.0.0",
-    "generatedAt": "2026-09-17T10:32:44.6181553Z",
+    "generatedAt": "2026-09-17T13:50:12.9539307Z",
     "powerShellVersion": "7.6.6",
     "tenantId": "b58ec690-6b8a-4a87-8145-b34c83bda100",
     "disclaimer": "Conclusions are bounded to application permissions. Delegated permissions are not evaluated."
@@ -21,7 +21,7 @@
   "read": {
     "principalsTotal": 305,
     "expandPages": 4,
-    "expandDurationMs": 839,
+    "expandDurationMs": 781,
     "relationRendered": 4,
     "scopedPrincipals": 9,
     "zeroConfirmingReads": 5,
@@ -461,7 +461,21 @@
       "severity": "Warning",
       "code": "ExpandCollectionTruncated",
       "object": "agd-lab-g-troncature",
-      "message": "$expand returned 20 assignments out of 25 actual. Missing: AgdLab.Trunc.18, AgdLab.Trunc.16, AgdLab.Trunc.10, AgdLab.Trunc.20, AgdLab.Trunc.15. No continuation link and no announced count in the payload. Documented behaviour: $expand returns at most 20 items for an expanded relationship on a directoryObject-derived resource, with no @odata.nextLink. See learn.microsoft.com/graph/query-parameters#expand."
+      "message": "$expand returned 20 assignments out of 25 actual.",
+      "details": {
+        "expanded": 20,
+        "actual": 25,
+        "missing": [
+          "AgdLab.Trunc.18",
+          "AgdLab.Trunc.16",
+          "AgdLab.Trunc.10",
+          "AgdLab.Trunc.20",
+          "AgdLab.Trunc.15"
+        ],
+        "payloadSignal": "No continuation link and no announced count.",
+        "documented": "At most 20 items are returned for an expanded relationship on a directoryObject-derived resource, with no @odata.nextLink.",
+        "reference": "https://learn.microsoft.com/graph/query-parameters#expand"
+      }
     }
   ]
 }

@@ -133,7 +133,13 @@ See `samples/intent.json`.
 
 The tool enumerates service principals rather than app registrations. Starting from registrations can never reach the principals that hold grants without a local registration, and that is the population this tool exists to make visible.
 
-Reading assignments principal by principal costs one call each. A single paginated `$expand=appRoleAssignments` is roughly thirty times faster. It also has two properties that make it unusable on its own.
+Reading assignments principal by principal costs one call each. A single paginated call is roughly thirty times faster:
+
+```
+GET /servicePrincipals?$select=id,appId,displayName&$expand=appRoleAssignments
+```
+
+It also has two properties that make it unusable on its own.
 
 **Absence of the property is not zero.** `$expand` omits `appRoleAssignments` entirely for principals that hold none, rather than returning an empty array. A reader that treats the absence as zero converts an unobserved state into an observed one.
 
@@ -143,11 +149,14 @@ The documented behaviour is at [learn.microsoft.com/graph/query-parameters#expan
 
 The tool therefore uses `$expand` to establish which principals hold grants, then re-reads individually every non-empty expanded collection, and issues a targeted read wherever a zero carries a conclusion. On a tenant of 305 principals that is four pages plus nine individual reads, against 305 in a naive enumeration. A repaired truncation is reported as `ExpandCollectionTruncated` and surfaced in `observation.expandCompleteness`.
 
-`ExpandCollectionTruncated` an expanded collection was incomplete and was repaired by an individual read. The diagnostic names the permissions that `$expand` had omitted: how many were missing does not tell a reader whether they were read-only roles or `Directory.ReadWrite.All`.
 `read.evaluatedWithoutRows` lists the principals in scope that produced no evaluation row, with the facts the engine holds about each: local registration, declared count, observed count, presence in the manifest. No taxonomy. Whether an object is a resource rather than a client is not among those facts — the engine reads neither `appRoles` nor `appRoleAssignedTo` — so saying so would be an inference drawn from its name.
 
 ## Diagnostics
 
+Each entry carries `severity`, `code`, `object` and a one-sentence `message`. Where there are structured facts to record, a `details` object carries them: identifiers stay identifiers rather than being joined into prose a consumer would have to split apart.
+
+`ExpandCollectionTruncated` an expanded collection was incomplete and was repaired by an individual read. `details` names the permissions `$expand` omitted, because how many were missing does not tell a reader whether they were read-only roles or `Directory.ReadWrite.All`, and links the page where the cap is published.
+`ExpandReadsDisagree` the two reads differ and the cause is not established: something present in the expansion is absent from the re-read. A capped expansion and a change between the two reads produce the same difference. `details.causeEstablished` is false. The re-read is retained as the later observation.
 `CompletenessNotVerified` the re-read failed, so the completeness of the expanded collection is unknown. Its grants still count as present; no absence is established for that principal, so `UnderCoverage` and `CorrectExclusion` are withheld and named in `assessment.reasons` instead.
 `GrantStateNotObserved` assignments could not be read for a principal in scope.
 `ManifestClaimsCompleteButOmitsGrantHolder` the manifest declares itself complete and omits a principal that holds assignments. The exhaustiveness claim is contradicted by the tenant.
