@@ -412,6 +412,8 @@ function Get-ResourceAppId {
 $evaluation          = [System.Collections.Generic.List[object]]::new()
 $completenessReasons = [System.Collections.Generic.List[string]]::new()
 $notJudgeable        = [System.Collections.Generic.List[string]]::new()
+$withoutRows         = [System.Collections.Generic.List[object]]::new()
+$correctlyEmptyCount = 0
 
 if ($intentStatus -eq 'Absent')                              { $completenessReasons.Add('No intent manifest was provided.') }
 if ($intentStatus -eq 'Available' -and -not $intentComplete) { $completenessReasons.Add('The manifest declares itself not complete.') }
@@ -497,6 +499,7 @@ foreach ($spId in @($scope)) {
     # where things the engine could not establish belong.
     $completenessUnverified = $grantsUnverified.Contains($spId)
     $withheld = [System.Collections.Generic.List[string]]::new()
+    $rowsBefore = $evaluation.Count
 
     foreach ($key in @(@($expected.Keys) + @($observed.Keys) | Select-Object -Unique)) {
         $exp = if ($expected.ContainsKey($key)) { [bool]$expected[$key] } else { $null }
@@ -530,6 +533,29 @@ foreach ($spId in @($scope)) {
         })
     }
 
+    # A principal in scope that produced no row at all is invisible in the
+    # evaluation, and a reader cannot tell it from one that was never reached.
+    # Report the facts the engine holds about it - no taxonomy. Whether an object
+    # is a resource rather than a client is not among them: the engine reads
+    # neither appRoles nor appRoleAssignedTo, so saying so would be an inference
+    # drawn from its name.
+    if ($evaluation.Count -eq $rowsBefore) {
+        $expectedHasSource = $entry -and ($entry.PermissionsProvided -or $registration)
+        $isCorrectlyEmpty  = ($intentStatus -eq 'Available') -and $entry -and $entry.Complete `
+                             -and $expectedHasSource -and ($expected.Count -eq 0) -and ($observed.Count -eq 0)
+        if ($isCorrectlyEmpty) { $correctlyEmptyCount++ }
+        $withoutRows.Add([pscustomobject]@{
+            displayName         = $sp.DisplayName
+            principalAppId      = $appId
+            localRegistration   = [bool]$registration
+            declaredPermissions = $declaredPositive.Count
+            observedGrants      = $observed.Count
+            inManifest          = [bool]$entry
+            manifestComplete    = if ($entry) { $entry.Complete } else { $null }
+            correctlyEmpty      = $isCorrectlyEmpty
+        })
+    }
+
     if ($completenessUnverified) {
         $detail = if ($withheld.Count -gt 0) { " Withheld: $($withheld -join ', ')." } else { '' }
         $completenessReasons.Add("The completeness of the grants of '$($sp.DisplayName)' could not be verified, so no absence was established for it.$detail")
@@ -550,15 +576,29 @@ foreach ($spId in @($scope)) {
 
 # ── 7. Three axes ───────────────────────────────────────────────────────────
 
-$states = @('CorrectCoverage','CorrectExclusion','UnderCoverage','OverCoverage','NotInManifest','Observed')
-$counts = [ordered]@{}
-foreach ($s in $states) { $counts[$s] = @($evaluation | Where-Object { $_.state -eq $s }).Count }
+# summary has two tiers because its counters do not count the same thing, and do
+# not cover the same population. perPermission counts evaluation rows, one per
+# permission, across every principal read. perEntry counts manifest ENTRIES, and
+# only exists when a manifest was supplied. Flattening the two would let a reader,
+# or an aggregator, sum eight numbers into a total that designates nothing.
+#
+# Neither perEntry counter is a row state: both count entries that produced no row
+# at all. They are carried anyway, because summary is where a reader counts what
+# happened. NotResolved: the entry named something that could not be resolved, so
+# nothing was evaluated. CorrectlyEmpty: the entry declared itself complete, what
+# it expected was empty, and nothing was granted - an affirmation the engine
+# verified. Without them the totals read as full coverage at one end and as a
+# shorter population at the other.
 
-# NotResolved is not a row state: unresolved entries produce no row at all.
-# It is carried in summary anyway, because summary is where a reader counts what
-# happened. Without it the totals read as full coverage while some entries were
-# never evaluated. Rows that do not exist belong in the same table as rows that do.
-$counts['NotResolved'] = $intentNotResolved
+$states = @('CorrectCoverage','CorrectExclusion','UnderCoverage','OverCoverage','NotInManifest','Observed')
+$perPermission = [ordered]@{}
+foreach ($s in $states) { $perPermission[$s] = @($evaluation | Where-Object { $_.state -eq $s }).Count }
+
+# Without a manifest, perEntry is meaningless rather than zero: there are no
+# entries to count. Two zeros would read as two passed verifications.
+$perEntry = if ($intentStatus -eq 'Available') {
+    [pscustomobject][ordered]@{ NotResolved = $intentNotResolved; CorrectlyEmpty = $correctlyEmptyCount }
+} else { $null }
 
 if ($notJudgeable.Count -gt 0) {
     $names = @($notJudgeable | Sort-Object -Unique)
@@ -578,13 +618,13 @@ $observation = [pscustomobject]@{
     note                 = 'Microsoft Graph documents replication delays on app role assignments and exposes no convergence indicator. That the snapshot read is current has not been established.'
 }
 
-$hasGap = ($counts['UnderCoverage'] -gt 0) -or ($counts['OverCoverage'] -gt 0)
+$hasGap = ($perPermission['UnderCoverage'] -gt 0) -or ($perPermission['OverCoverage'] -gt 0)
 
 $conclusion =
     if ($hasGap) {
         $parts = @()
-        if ($counts['UnderCoverage'] -gt 0) { $parts += "$($counts['UnderCoverage']) permission(s) declared and not granted" }
-        if ($counts['OverCoverage']  -gt 0) { $parts += "$($counts['OverCoverage']) permission(s) granted and not expected" }
+        if ($perPermission['UnderCoverage'] -gt 0) { $parts += "$($perPermission['UnderCoverage']) permission(s) declared and not granted" }
+        if ($perPermission['OverCoverage']  -gt 0) { $parts += "$($perPermission['OverCoverage']) permission(s) granted and not expected" }
         [pscustomobject]@{
             result            = 'GapEstablished'
             detail            = ($parts -join '. ') + '.'
@@ -642,10 +682,14 @@ $report = [pscustomobject]@{
         expandTruncated          = $truncated
         grantStateNotObserved    = $notObserved.Count
         grantCompletenessUnverified = $grantsUnverified.Count
+        evaluatedWithoutRows        = $withoutRows.ToArray()
         grantHoldersNotJudgeable = @($notJudgeable | Sort-Object -Unique).Count
     }
     evaluation  = $evaluation.ToArray()
-    summary     = [pscustomobject]$counts
+    summary     = [pscustomobject]@{
+        perPermission = [pscustomobject]$perPermission
+        perEntry      = $perEntry
+    }
     assessment  = [pscustomobject]@{ completeness = $completeness; reasons = $reasons }
     observation = $observation
     conclusion  = $conclusion

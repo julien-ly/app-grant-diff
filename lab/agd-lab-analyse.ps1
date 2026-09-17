@@ -373,6 +373,8 @@ function Get-AppIdRessource {
 $evaluation = [System.Collections.Generic.List[object]]::new()
 $completenessReasons = [System.Collections.Generic.List[string]]::new()
 $nonJugeables = [System.Collections.Generic.List[string]]::new()
+$sansLigne    = [System.Collections.Generic.List[object]]::new()
+$correctlyEmptyCount = 0
 
 if ($intentStatus -eq 'Absent')                      { $completenessReasons.Add('Aucun manifeste d''intention n''a ete fourni.') }
 if ($intentStatus -eq 'Available' -and -not $intentComplete) { $completenessReasons.Add('Le manifeste se declare non exhaustif.') }
@@ -462,6 +464,7 @@ foreach ($spId in @($perimetre)) {
     # CorrectExclusion, est retenu et bascule dans assessment.reasons.
     $completudeNonVerifiee = $grantsNonVerifies.Contains($spId)
     $retenues = [System.Collections.Generic.List[string]]::new()
+    $lignesAvant = $evaluation.Count
 
     foreach ($cle in @(@($attendu.Keys) + @($observe.Keys) | Select-Object -Unique)) {
         $exp = if ($attendu.ContainsKey($cle)) { [bool]$attendu[$cle] } else { $null }
@@ -495,6 +498,28 @@ foreach ($spId in @($perimetre)) {
         })
     }
 
+    # Un principal du perimetre qui ne produit aucune ligne est invisible dans
+    # l'evaluation, et le lecteur ne peut pas le distinguer d'un principal jamais
+    # atteint. On rapporte les faits detenus, sans taxonomie. Qu'un objet soit une
+    # ressource et non un client n'en fait pas partie : le moteur ne lit ni les
+    # appRoles ni appRoleAssignedTo, le dire serait une inference tiree du nom.
+    if ($evaluation.Count -eq $lignesAvant) {
+        $attenduAUneSource = $entree -and ($entree.PermissionsFournies -or $inscription)
+        $estCorrectlyEmpty = ($intentStatus -eq 'Available') -and $entree -and $entree.Complete `
+                             -and $attenduAUneSource -and ($attendu.Count -eq 0) -and ($observe.Count -eq 0)
+        if ($estCorrectlyEmpty) { $correctlyEmptyCount++ }
+        $sansLigne.Add([pscustomobject]@{
+            displayName         = $sp.DisplayName
+            principalAppId      = $appId
+            localRegistration   = [bool]$inscription
+            declaredPermissions = $declarePositif.Count
+            observedGrants      = $observe.Count
+            inManifest          = [bool]$entree
+            manifestComplete    = if ($entree) { $entree.Complete } else { $null }
+            correctlyEmpty      = $estCorrectlyEmpty
+        })
+    }
+
     if ($completudeNonVerifiee) {
         $detail = if ($retenues.Count -gt 0) { " Retenues : $($retenues -join ', ')." } else { '' }
         $completenessReasons.Add("La completude des attributions de '$($sp.DisplayName)' n'a pas pu etre verifiee, aucune absence n'a donc ete etablie pour lui.$detail")
@@ -515,17 +540,25 @@ foreach ($spId in @($perimetre)) {
 
 # ── 7. Trois axes ───────────────────────────────────────────────────────────
 
+# summary a deux etages : ses compteurs ne comptent pas la meme chose et ne
+# couvrent pas la meme population. perPermission compte des lignes d'evaluation,
+# une par permission, sur tous les principaux lus. perEntry compte des ENTREES de
+# manifeste, et n'existe que si un manifeste a ete fourni. A plat, un lecteur ou
+# un agregateur pourrait sommer huit nombres en un total qui ne designe rien.
+#
+# Aucun des deux compteurs perEntry n'est un etat de ligne : tous deux comptent
+# des entrees qui n'ont produit aucune ligne. Ils figurent quand meme, parce que
+# summary est la table ou un lecteur compte ce qui s'est passe.
+
 $etats = @('CorrectCoverage','CorrectExclusion','UnderCoverage','OverCoverage','NotInManifest','Observed')
-$counts = [ordered]@{}
-foreach ($e in $etats) { $counts[$e] = @($evaluation | Where-Object { $_.state -eq $e }).Count }
+$perPermission = [ordered]@{}
+foreach ($e in $etats) { $perPermission[$e] = @($evaluation | Where-Object { $_.state -eq $e }).Count }
 
-# NotResolved n'est pas un etat de ligne : une entree non resolue ne produit
-# aucune ligne. Il figure quand meme dans summary, parce que summary est la
-# table ou un lecteur compte ce qui s'est passe. Sans lui, les totaux se lisent
-# comme une couverture complete alors que des entrees n'ont jamais ete evaluees.
-$counts['NotResolved'] = $intentNotResolved
-
-$hasGap = ($counts['UnderCoverage'] -gt 0) -or ($counts['OverCoverage'] -gt 0)
+# Sans manifeste, perEntry est depourvu de sens et non vide de valeur : il n'y a
+# aucune entree a compter. Deux zeros se liraient comme deux verifications passees.
+$perEntry = if ($intentStatus -eq 'Available') {
+    [pscustomobject][ordered]@{ NotResolved = $intentNotResolved; CorrectlyEmpty = $correctlyEmptyCount }
+} else { $null }
 
 if ($nonJugeables.Count -gt 0) {
     $noms = @($nonJugeables | Sort-Object -Unique)
@@ -551,8 +584,8 @@ $observation = [pscustomobject]@{
 $conclusion =
     if ($hasGap) {
         $parts = @()
-        if ($counts['UnderCoverage'] -gt 0) { $parts += "$($counts['UnderCoverage']) permission(s) declaree(s) et non accordee(s)" }
-        if ($counts['OverCoverage']  -gt 0) { $parts += "$($counts['OverCoverage']) permission(s) accordee(s) et non attendue(s)" }
+        if ($perPermission['UnderCoverage'] -gt 0) { $parts += "$($perPermission['UnderCoverage']) permission(s) declaree(s) et non accordee(s)" }
+        if ($perPermission['OverCoverage']  -gt 0) { $parts += "$($perPermission['OverCoverage']) permission(s) accordee(s) et non attendue(s)" }
         [pscustomobject]@{
             result            = 'GapEstablished'
             detail            = ($parts -join '. ') + '.'
@@ -610,10 +643,14 @@ $rapport = [pscustomobject]@{
         expandTruncated      = $tronquees
         grantStateNotObserved = $nonObserves.Count
         grantCompletenessUnverified = $grantsNonVerifies.Count
+        evaluatedWithoutRows        = $sansLigne.ToArray()
         grantHoldersNotJudgeable = @($nonJugeables | Sort-Object -Unique).Count
     }
     evaluation  = $evaluation.ToArray()
-    summary     = [pscustomobject]$counts
+    summary     = [pscustomobject]@{
+        perPermission = [pscustomobject]$perPermission
+        perEntry      = $perEntry
+    }
     assessment  = [pscustomobject]@{ completeness = $completeness; reasons = $reasons }
     observation = $observation
     conclusion  = $conclusion

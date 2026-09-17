@@ -15,7 +15,24 @@ A four-state matrix crossing the expected permission against the observed grant.
 
 Two further states exist for grants the matrix cannot classify. **Not in manifest**, when a grant holder is absent from a manifest that does not claim exhaustiveness, or carries an entry that does not. **Observed**, when no manifest was provided at all.
 
-`summary` carries a seventh counter, **`NotResolved`**, which is not a row state. An entry naming a principal absent from the tenant, or carrying no usable `appId`, produces no evaluation row at all. It is counted anyway, because `summary` is where a reader counts what happened: without it the totals read as full coverage while some entries were never evaluated.
+## Two tiers in summary
+
+`summary` has two tiers, because its counters do not count the same thing and do not cover the same population.
+
+**`summary.perPermission`** counts evaluation rows, one per permission, across every principal read: the six states above.
+
+**`summary.perEntry`** counts manifest *entries*, and is null when no manifest was supplied. Neither of its counters is a row state; both count entries that produced no evaluation row at all.
+
+**`NotResolved`** — the entry named a principal absent from the tenant, or carried no usable `appId`. Nothing was evaluated for it.
+**`CorrectlyEmpty`** — the entry declared itself complete, what it expected was empty, and nothing was granted. An affirmation the engine verified, not a silence.
+
+Both are carried because `summary` is where a reader counts what happened, not where rows are summed. Without `NotResolved` the totals read as full coverage while some entries were never evaluated. Without `CorrectlyEmpty` a principal verified as expecting nothing and holding nothing counts nowhere, and the totals read as if it had not been part of the evaluation.
+
+The two tiers are separate objects rather than eight flat keys so that nothing sums by accident. A total across all of them would designate nothing.
+
+`CorrectlyEmpty` is restricted to entries that make the affirmation: `complete: true`, an expected set that is empty, and a source for that expected set — either `permissions` supplied, or a local registration the entry vouches for. `complete: false` with an empty `permissions` affirms nothing at all: it lists expectations without claiming exhaustiveness, and lists none. It is indistinguishable from having no entry.
+
+The restriction is what makes the counter mean something where the tool is otherwise blind. A third-party principal with no local registration and no assignments can produce no fact: no readable declaration, no grant, so no row. The manifest is the only possible source of declared state for it, and "nothing is expected" is the only statement that can be made about it.
 
 An unresolved entry degrades the **whole report**, not only its own principal. Over-coverage is established only against a fully resolved reference, so one stale line in a manifest of a thousand suppresses `OverCoverage` across the tenant. `complete: false` on a principal, by contrast, degrades that principal alone. The rule is deliberate, since a manifest naming something that does not exist does not describe the population it claims to describe; the asymmetry between the two is the part that surprises.
 
@@ -124,9 +141,11 @@ The documented behaviour is at [learn.microsoft.com/graph/query-parameters#expan
 
 The tool therefore uses `$expand` to establish which principals hold grants, then re-reads individually every non-empty expanded collection, and issues a targeted read wherever a zero carries a conclusion. On a tenant of 305 principals that is four pages plus nine individual reads, against 305 in a naive enumeration. A repaired truncation is reported as `ExpandCollectionTruncated` and surfaced in `observation.expandCompleteness`.
 
+`ExpandCollectionTruncated` an expanded collection was incomplete and was repaired by an individual read.
+`read.evaluatedWithoutRows` lists the principals in scope that produced no evaluation row, with the facts the engine holds about each: local registration, declared count, observed count, presence in the manifest. No taxonomy. Whether an object is a resource rather than a client is not among those facts — the engine reads neither `appRoles` nor `appRoleAssignedTo` — so saying so would be an inference drawn from its name.
+
 ## Diagnostics
 
-`ExpandCollectionTruncated` an expanded collection was incomplete and was repaired by an individual read.
 `CompletenessNotVerified` the re-read failed, so the completeness of the expanded collection is unknown. Its grants still count as present; no absence is established for that principal, so `UnderCoverage` and `CorrectExclusion` are withheld and named in `assessment.reasons` instead.
 `GrantStateNotObserved` assignments could not be read for a principal in scope.
 `ManifestClaimsCompleteButOmitsGrantHolder` the manifest declares itself complete and omits a principal that holds assignments. The exhaustiveness claim is contradicted by the tenant.

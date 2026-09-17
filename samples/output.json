@@ -1,7 +1,7 @@
 {
   "metadata": {
     "toolVersion": "1.0.0",
-    "generatedAt": "2026-09-17T07:49:24.6533704Z",
+    "generatedAt": "2026-09-17T07:54:46.4757969Z",
     "powerShellVersion": "7.6.6",
     "tenantId": "b58ec690-6b8a-4a87-8145-b34c83bda100",
     "disclaimer": "Conclusions are bounded to application permissions. Delegated permissions are not evaluated."
@@ -21,7 +21,7 @@
   "read": {
     "principalsTotal": 305,
     "expandPages": 4,
-    "expandDurationMs": 792,
+    "expandDurationMs": 741,
     "relationRendered": 4,
     "scopedPrincipals": 9,
     "zeroConfirmingReads": 5,
@@ -29,6 +29,38 @@
     "expandTruncated": 1,
     "grantStateNotObserved": 0,
     "grantCompletenessUnverified": 0,
+    "evaluatedWithoutRows": [
+      {
+        "displayName": "agd-lab-h-controle-negatif",
+        "principalAppId": "4695bc55-0f1f-4210-a579-fae1dbaca5a5",
+        "localRegistration": true,
+        "declaredPermissions": 0,
+        "observedGrants": 0,
+        "inManifest": true,
+        "manifestComplete": true,
+        "correctlyEmpty": true
+      },
+      {
+        "displayName": "agd-lab-e-controle-negatif",
+        "principalAppId": "ea37239a-1c5d-4bfa-a249-5e299933569e",
+        "localRegistration": true,
+        "declaredPermissions": 0,
+        "observedGrants": 0,
+        "inManifest": true,
+        "manifestComplete": true,
+        "correctlyEmpty": true
+      },
+      {
+        "displayName": "agd-lab-c-ressource",
+        "principalAppId": "bc96b16d-24c8-48c0-9f8e-9333cf4c2134",
+        "localRegistration": true,
+        "declaredPermissions": 0,
+        "observedGrants": 0,
+        "inManifest": true,
+        "manifestComplete": true,
+        "correctlyEmpty": true
+      }
+    ],
     "grantHoldersNotJudgeable": 0
   },
   "evaluation": [
@@ -394,13 +426,18 @@
     }
   ],
   "summary": {
-    "CorrectCoverage": 1,
-    "CorrectExclusion": 1,
-    "UnderCoverage": 1,
-    "OverCoverage": 27,
-    "NotInManifest": 0,
-    "Observed": 0,
-    "NotResolved": 0
+    "perPermission": {
+      "CorrectCoverage": 1,
+      "CorrectExclusion": 1,
+      "UnderCoverage": 1,
+      "OverCoverage": 27,
+      "NotInManifest": 0,
+      "Observed": 0
+    },
+    "perEntry": {
+      "NotResolved": 0,
+      "CorrectlyEmpty": 3
+    }
   },
   "assessment": {
     "completeness": "Complete",
