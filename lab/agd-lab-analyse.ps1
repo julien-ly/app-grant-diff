@@ -292,6 +292,10 @@ $lecturesCiblees   = 0
 $lecturesCompletude = 0
 $tronquees         = 0
 $nonObserves = [System.Collections.Generic.List[string]]::new()
+# Principaux dont les attributions sont PRESENTES mais dont la completude n'a
+# pas pu etre verifiee, la relecture ayant echoue. Leurs grants observes sont
+# des faits, leurs absences n'en sont pas.
+$grantsNonVerifies = [System.Collections.Generic.HashSet[string]]::new()
 
 foreach ($id in @($perimetre)) {
 
@@ -322,10 +326,14 @@ foreach ($id in @($perimetre)) {
         $grantsParSpId[$id] = $complet
     } catch {
         if ($dejaRendu) {
-            # La relecture a echoue : on garde ce que $expand avait rendu, mais
-            # on ne peut pas affirmer que c'est complet.
+            # La collection developpee vaut preuve de PRESENCE. Elle ne vaut pas
+            # preuve d'absence : $expand plafonne les relations developpees, donc
+            # une permission absente du resultat peut exister sans avoir ete
+            # rendue. Garder les grants et evaluer les absences contre eux
+            # transformerait un etat non verifie en etat observe.
+            [void]$grantsNonVerifies.Add($id)
             Add-Diagnostic 'Warning' 'CompletenessNotVerified' $spParSpId[$id].DisplayName `
-                "Relecture impossible, le resultat `$expand n'a pas pu etre verifie : $($_.Exception.Message)"
+                "Relecture impossible, le resultat `$expand n'a pas pu etre verifie, sa completude est inconnue : $($_.Exception.Message)"
         } else {
             $nonObserves.Add($id)
             Add-Diagnostic 'Error' 'GrantStateNotObserved' $spParSpId[$id].DisplayName `
@@ -449,9 +457,17 @@ foreach ($spId in @($perimetre)) {
 
     $aProduitNotInManifest = $false
 
+    # Completude non verifiee : seules les lignes portant un grant observe sont
+    # emises. Tout etat reposant sur une absence, UnderCoverage et
+    # CorrectExclusion, est retenu et bascule dans assessment.reasons.
+    $completudeNonVerifiee = $grantsNonVerifies.Contains($spId)
+    $retenues = [System.Collections.Generic.List[string]]::new()
+
     foreach ($cle in @(@($attendu.Keys) + @($observe.Keys) | Select-Object -Unique)) {
         $exp = if ($attendu.ContainsKey($cle)) { [bool]$attendu[$cle] } else { $null }
         $obs = $observe.ContainsKey($cle)
+
+        if ($completudeNonVerifiee -and -not $obs) { $retenues.Add($cle); continue }
 
         $state =
             if ($exp -eq $true  -and $obs)      { 'CorrectCoverage' }
@@ -477,6 +493,11 @@ foreach ($spId in @($perimetre)) {
             source          = if ($null -eq $exp) { 'grant' } elseif ($inscription) { 'registration' } else { 'intent' }
             localRegistration = [bool]$inscription
         })
+    }
+
+    if ($completudeNonVerifiee) {
+        $detail = if ($retenues.Count -gt 0) { " Retenues : $($retenues -join ', ')." } else { '' }
+        $completenessReasons.Add("La completude des attributions de '$($sp.DisplayName)' n'a pas pu etre verifiee, aucune absence n'a donc ete etablie pour lui.$detail")
     }
 
     # Ne nommer un principal que s'il a reellement produit une ligne non
@@ -588,6 +609,7 @@ $rapport = [pscustomobject]@{
         completenessReads    = $lecturesCompletude
         expandTruncated      = $tronquees
         grantStateNotObserved = $nonObserves.Count
+        grantCompletenessUnverified = $grantsNonVerifies.Count
         grantHoldersNotJudgeable = @($nonJugeables | Sort-Object -Unique).Count
     }
     evaluation  = $evaluation.ToArray()

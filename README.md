@@ -127,7 +127,7 @@ The tool therefore uses `$expand` to establish which principals hold grants, the
 ## Diagnostics
 
 `ExpandCollectionTruncated` an expanded collection was incomplete and was repaired by an individual read.
-`CompletenessNotVerified` the re-read failed, so the `$expand` result could not be verified.
+`CompletenessNotVerified` the re-read failed, so the completeness of the expanded collection is unknown. Its grants still count as present; no absence is established for that principal, so `UnderCoverage` and `CorrectExclusion` are withheld and named in `assessment.reasons` instead.
 `GrantStateNotObserved` assignments could not be read for a principal in scope.
 `ManifestClaimsCompleteButOmitsGrantHolder` the manifest declares itself complete and omits a principal that holds assignments. The exhaustiveness claim is contradicted by the tenant.
 `ManifestDeclarationMismatch` the manifest and `requiredResourceAccess` disagree.

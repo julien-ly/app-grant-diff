@@ -332,6 +332,10 @@ $zeroConfirmingReads = 0
 $completenessReads   = 0
 $truncated           = 0
 $notObserved = [System.Collections.Generic.List[string]]::new()
+# Principals whose grants are PRESENT but whose completeness could not be
+# verified, because the individual re-read failed. Their observed grants are
+# facts; their absences are not.
+$grantsUnverified = [System.Collections.Generic.HashSet[string]]::new()
 
 foreach ($id in @($scope)) {
 
@@ -361,8 +365,14 @@ foreach ($id in @($scope)) {
         $grantsBySpId[$id] = $full
     } catch {
         if ($alreadyRendered) {
+            # The expanded collection stands as evidence of presence. It cannot
+            # stand as evidence of absence: $expand caps expanded relationships,
+            # so a permission missing from it may exist and not have been
+            # returned. Keeping the grants and evaluating absences against them
+            # would turn an unverified state into an observed one.
+            [void]$grantsUnverified.Add($id)
             Add-Diagnostic 'Warning' 'CompletenessNotVerified' $spBySpId[$id].DisplayName `
-                "Re-read failed, the `$expand result could not be verified: $($_.Exception.Message)"
+                "Re-read failed, the `$expand result could not be verified, so its completeness is unknown: $($_.Exception.Message)"
         } else {
             $notObserved.Add($id)
             Add-Diagnostic 'Error' 'GrantStateNotObserved' $spBySpId[$id].DisplayName `
@@ -481,9 +491,18 @@ foreach ($spId in @($scope)) {
 
     $producedNotInManifest = $false
 
+    # When completeness is unverified, only rows carrying an observed grant are
+    # emitted. Every state that rests on an absence - UnderCoverage and
+    # CorrectExclusion - is withheld and moved to assessment.reasons, which is
+    # where things the engine could not establish belong.
+    $completenessUnverified = $grantsUnverified.Contains($spId)
+    $withheld = [System.Collections.Generic.List[string]]::new()
+
     foreach ($key in @(@($expected.Keys) + @($observed.Keys) | Select-Object -Unique)) {
         $exp = if ($expected.ContainsKey($key)) { [bool]$expected[$key] } else { $null }
         $obs = $observed.ContainsKey($key)
+
+        if ($completenessUnverified -and -not $obs) { $withheld.Add($key); continue }
 
         $state =
             if     ($exp -eq $true  -and $obs)      { 'CorrectCoverage' }
@@ -509,6 +528,11 @@ foreach ($spId in @($scope)) {
             source            = if ($null -eq $exp) { 'grant' } elseif ($registration) { 'registration' } else { 'intent' }
             localRegistration = [bool]$registration
         })
+    }
+
+    if ($completenessUnverified) {
+        $detail = if ($withheld.Count -gt 0) { " Withheld: $($withheld -join ', ')." } else { '' }
+        $completenessReasons.Add("The completeness of the grants of '$($sp.DisplayName)' could not be verified, so no absence was established for it.$detail")
     }
 
     # Name a principal only when it actually produced an unjudgeable row. A
@@ -617,6 +641,7 @@ $report = [pscustomobject]@{
         completenessReads        = $completenessReads
         expandTruncated          = $truncated
         grantStateNotObserved    = $notObserved.Count
+        grantCompletenessUnverified = $grantsUnverified.Count
         grantHoldersNotJudgeable = @($notJudgeable | Sort-Object -Unique).Count
     }
     evaluation  = $evaluation.ToArray()
