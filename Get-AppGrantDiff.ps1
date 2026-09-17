@@ -77,14 +77,14 @@
     Suppress the console summary. The file and -PassThru are unaffected.
 
 .EXAMPLE
-    Connect-MgGraph -Scopes 'Application.Read.All','Directory.Read.All'
+    Connect-MgGraph -Scopes 'Application.Read.All'
     .\Get-AppGrantDiff.ps1
 
 .EXAMPLE
     .\Get-AppGrantDiff.ps1 -IntentPath .\samples\intent.json -OutputPath .\report.json
 
 .NOTES
-    Read-only. Requires Application.Read.All and Directory.Read.All.
+    Read-only. Requires Application.Read.All, the least privileged permission documented for every endpoint it reads.
     MIT. https://github.com/julien-ly/app-grant-diff
 #>
 
@@ -123,7 +123,7 @@ if ($authLoaded.Count -eq 1) {
 
 $context = Get-MgContext
 if (-not $context) {
-    throw "Not connected. Run: Connect-MgGraph -Scopes 'Application.Read.All','Directory.Read.All'"
+    throw "Not connected. Run: Connect-MgGraph -Scopes 'Application.Read.All'"
 }
 $tenantId = $context.TenantId
 Write-Line "Tenant : $tenantId"
@@ -143,6 +143,14 @@ function Get-Field {
     $p = $Item.PSObject.Properties[$Name]
     if ($p) { return $p.Value }
     return $null
+}
+
+function Get-EntrySignature {
+    # Two entries for the same principal are identical only if they say the same
+    # thing. Comparing on appId alone would call a contradiction a duplicate.
+    param($Entry)
+    $perms = @($Entry.Permissions | ForEach-Object { "$($_.Key)=$($_.ExpectedGranted)" } | Sort-Object) -join ';'
+    "$($Entry.Complete)|$($Entry.PermissionsProvided)|$perms"
 }
 
 $diagnostics = [System.Collections.Generic.List[object]]::new()
@@ -180,7 +188,13 @@ if ($IntentPath) {
     if ($null -eq $raw.PSObject.Properties['complete']) {
         throw "The manifest carries no 'complete' field. It is mandatory and never inferred."
     }
-    $intentComplete    = [bool]$raw.complete
+    # PowerShell casts any non-empty string to $true, so [bool]"false" is $true.
+    # A JSON string where a boolean belongs would silently invert an
+    # exhaustiveness claim. Check the type; never coerce.
+    if ($raw.complete -isnot [bool]) {
+        throw "The manifest declares 'complete' as $($raw.complete.GetType().Name), not a JSON boolean. A string is not coerced: PowerShell reads ""false"" as true."
+    }
+    $intentComplete    = $raw.complete
     $intentStatus      = 'Available'
     $intentDescription = if ($raw.PSObject.Properties['description']) { $raw.description } else { $null }
     $intentAsOf        = if ($raw.PSObject.Properties['asOf']) { $raw.asOf } else { $null }
@@ -192,35 +206,63 @@ if ($IntentPath) {
         if ($null -eq $p.PSObject.Properties['complete']) {
             throw "Entry '$label' carries no 'complete' field. It is mandatory per principal."
         }
+        if ($p.complete -isnot [bool]) {
+            $intentNotResolved++
+            Add-Diagnostic 'Warning' 'IntentEntryMalformed' $label `
+                "'complete' must be a JSON boolean, not $($p.complete.GetType().Name). Entry skipped: a string is not coerced."
+            continue
+        }
         if ($null -eq $p.PSObject.Properties['appId'] -or -not $p.appId) {
             $intentNotResolved++
             Add-Diagnostic 'Warning' 'IntentEntryNotResolved' $label 'The entry carries no usable appId.'
             continue
         }
-        if ($intentByAppId.ContainsKey($p.appId)) {
-            $intentDuplicates++
-            Add-Diagnostic 'Info' 'IntentEntryDuplicate' $label 'The principal appears more than once in the manifest.'
-            continue
-        }
 
         $permissions = @()
+        $malformed   = $null
         if ($p.PSObject.Properties['permissions']) {
             foreach ($q in @($p.permissions)) {
+                if ($null -eq $q.PSObject.Properties['expectedGranted'] -or $q.expectedGranted -isnot [bool]) {
+                    $malformed = "$($q.resourceAppId)/$($q.value)"
+                    break
+                }
                 $permissions += [pscustomobject]@{
                     ResourceAppId   = $q.resourceAppId
                     Value           = $q.value
-                    ExpectedGranted = [bool]$q.expectedGranted
+                    ExpectedGranted = $q.expectedGranted
                     Key             = "$($q.resourceAppId)/$($q.value)"
                 }
             }
         }
+        if ($malformed) {
+            # A manifest malformed about a principal cannot serve as its
+            # reference. Skipping the whole entry is the conservative reading.
+            $intentNotResolved++
+            Add-Diagnostic 'Warning' 'IntentEntryMalformed' $label `
+                "Permission '$malformed' must declare 'expectedGranted' as a JSON boolean. Entry skipped."
+            continue
+        }
 
-        $intentByAppId[$p.appId] = [pscustomobject]@{
+        $candidate = [pscustomobject]@{
             DisplayName         = $label
-            Complete            = [bool]$p.complete
+            Complete            = $p.complete
             Permissions         = @($permissions)
             PermissionsProvided = [bool]$p.PSObject.Properties['permissions']
         }
+
+        if ($intentByAppId.ContainsKey($p.appId)) {
+            # A manifest that contradicts itself about a principal cannot serve
+            # as a reference for it. Keeping the first silently would let an
+            # invalid manifest produce a confident claim, decided by line order.
+            if ((Get-EntrySignature $intentByAppId[$p.appId]) -ne (Get-EntrySignature $candidate)) {
+                throw "Intent manifest declares contradictory expectations for '$label' ($($p.appId))."
+            }
+            $intentDuplicates++
+            Add-Diagnostic 'Info' 'IntentEntryDuplicate' $label 'The principal appears more than once with identical content.'
+            continue
+        }
+
+        $intentByAppId[$p.appId] = $candidate
     }
     # Only file-level resolution is known at this point. Resolution against the
     # tenant happens later; reporting it here would print a figure that a later
@@ -307,7 +349,30 @@ foreach ($app in @(Get-MgApplication -All -Property 'id,appId,displayName,requir
 }
 Write-Line "$($declaredByAppId.Count) local registrations"
 
-# ── 4. Scope, and targeted individual reads ─────────────────────────────────
+# ── 4. Role name resolution ─────────────────────────────────────────────────
+
+$rolesByAppId = @{}
+function Get-RoleValue {
+    param([string]$ResourceAppId, [string]$RoleId)
+    if ($RoleId -eq $NullRoleId) { return '(assigned without a specific role)' }
+    if (-not $rolesByAppId.ContainsKey($ResourceAppId)) {
+        $found = @(Get-MgServicePrincipal -Filter "appId eq '$ResourceAppId'" -Property 'id,appId,displayName,appRoles')
+        $rolesByAppId[$ResourceAppId] = if ($found.Count -eq 1) { $found[0] } else { $null }
+    }
+    $sp = $rolesByAppId[$ResourceAppId]
+    if (-not $sp) { return "(role $RoleId on resource $ResourceAppId absent from the tenant)" }
+    $match = @($sp.AppRoles | Where-Object { $_.Id -eq $RoleId })
+    if ($match.Count -eq 0) { return "(role $RoleId not exposed by $($sp.DisplayName))" }
+    $match[0].Value
+}
+
+function Get-ResourceAppId {
+    param([string]$ResourceSpId)
+    if (-not $spBySpId.ContainsKey($ResourceSpId)) { return "(sp $ResourceSpId unknown)" }
+    $spBySpId[$ResourceSpId].AppId
+}
+
+# ── 5. Scope, and targeted individual reads ─────────────────────────────────
 
 $scope = [System.Collections.Generic.HashSet[string]]::new()
 foreach ($id in $grantsBySpId.Keys) { if (@($grantsBySpId[$id]).Count -gt 0) { [void]$scope.Add($id) } }
@@ -356,8 +421,18 @@ foreach ($id in @($scope)) {
         if ($alreadyRendered -and $full.Count -ne $expandCount[$id]) {
             $truncated++
             $signalled = $nestedSignals.ContainsKey($id)
+            # Both sets are in hand at the moment the gap is detected. Reporting
+            # only how many were missing leaves the reader with an unidentified
+            # absence: five roles could be read-only or Directory.ReadWrite.All.
+            # Establishing a gap without naming its scope is the same failure the
+            # tool reports elsewhere, applied to its own diagnostic.
+            $renderedIds = @($grantsBySpId[$id] | ForEach-Object { $_.Id })
+            $missing = @($full | Where-Object { $_.Id -notin $renderedIds } | ForEach-Object {
+                Get-RoleValue (Get-ResourceAppId $_.ResourceId) $_.AppRoleId
+            })
             Add-Diagnostic 'Warning' 'ExpandCollectionTruncated' $spBySpId[$id].DisplayName `
                 ("`$expand returned $($expandCount[$id]) assignments out of $($full.Count) actual. " +
+                 "Missing: $($missing -join ', '). " +
                  $(if ($signalled) { "Graph announced the rest: $($nestedSignals[$id] | ConvertTo-Json -Compress)." }
                    else { 'No continuation link and no announced count in the payload. Documented behaviour: $expand returns at most 20 items for an expanded relationship on a directoryObject-derived resource, with no @odata.nextLink. See learn.microsoft.com/graph/query-parameters#expand.' }))
         }
@@ -383,29 +458,6 @@ foreach ($id in @($scope)) {
 Write-Line "$($scope.Count) principals in scope"
 Write-Line "$zeroConfirmingReads reads to confirm a zero, $completenessReads to verify completeness"
 if ($truncated -gt 0 -and -not $Quiet) { Write-Warning "$truncated `$expand collection(s) truncated." }
-
-# ── 5. Role name resolution ─────────────────────────────────────────────────
-
-$rolesByAppId = @{}
-function Get-RoleValue {
-    param([string]$ResourceAppId, [string]$RoleId)
-    if ($RoleId -eq $NullRoleId) { return '(assigned without a specific role)' }
-    if (-not $rolesByAppId.ContainsKey($ResourceAppId)) {
-        $found = @(Get-MgServicePrincipal -Filter "appId eq '$ResourceAppId'" -Property 'id,appId,displayName,appRoles')
-        $rolesByAppId[$ResourceAppId] = if ($found.Count -eq 1) { $found[0] } else { $null }
-    }
-    $sp = $rolesByAppId[$ResourceAppId]
-    if (-not $sp) { return "(role $RoleId on resource $ResourceAppId absent from the tenant)" }
-    $match = @($sp.AppRoles | Where-Object { $_.Id -eq $RoleId })
-    if ($match.Count -eq 0) { return "(role $RoleId not exposed by $($sp.DisplayName))" }
-    $match[0].Value
-}
-
-function Get-ResourceAppId {
-    param([string]$ResourceSpId)
-    if (-not $spBySpId.ContainsKey($ResourceSpId)) { return "(sp $ResourceSpId unknown)" }
-    $spBySpId[$ResourceSpId].AppId
-}
 
 # ── 6. Evaluation matrix ────────────────────────────────────────────────────
 

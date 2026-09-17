@@ -64,7 +64,7 @@ Import-Module Microsoft.Graph.Authentication -RequiredVersion $common -Force
 Import-Module Microsoft.Graph.Applications   -RequiredVersion $common -Force
 Write-Host "Modules Graph pinnes en $common"
 
-Connect-MgGraph -Scopes 'Application.Read.All','Directory.Read.All' -ContextScope Process -NoWelcome
+Connect-MgGraph -Scopes 'Application.Read.All' -ContextScope Process -NoWelcome
 $tenantId = (Get-MgContext).TenantId
 Write-Host "Tenant  : $tenantId"
 
@@ -80,6 +80,14 @@ function Get-Champ {
     $p = $Item.PSObject.Properties[$Nom]
     if ($p) { return $p.Value }
     return $null
+}
+
+function Get-SignatureEntree {
+    # Deux entrees pour le meme principal ne sont identiques que si elles disent
+    # la meme chose. Comparer sur le seul appId appelle contradiction un doublon.
+    param($Entree)
+    $perms = @($Entree.Permissions | ForEach-Object { "$($_.Cle)=$($_.ExpectedGranted)" } | Sort-Object) -join ';'
+    "$($Entree.Complete)|$($Entree.PermissionsFournies)|$perms"
 }
 
 $diagnostics = [System.Collections.Generic.List[object]]::new()
@@ -117,7 +125,13 @@ if ($IntentPath) {
     if ($null -eq $raw.PSObject.Properties['complete']) {
         throw "Le manifeste ne porte pas de champ 'complete'. Il est obligatoire et n'est jamais infere."
     }
-    $intentComplete    = [bool]$raw.complete
+    # PowerShell convertit toute chaine non vide en $true, donc [bool]"false"
+    # vaut $true. Une chaine la ou un booleen est attendu inverserait
+    # silencieusement une revendication d'exhaustivite. On verifie le type.
+    if ($raw.complete -isnot [bool]) {
+        throw "Le manifeste declare 'complete' comme $($raw.complete.GetType().Name) et non comme un booleen JSON. Une chaine n'est pas convertie : PowerShell lit ""false"" comme vrai."
+    }
+    $intentComplete    = $raw.complete
     $intentStatus      = 'Available'
     $intentDescription = if ($raw.PSObject.Properties['description']) { $raw.description } else { $null }
     $intentAsOf        = if ($raw.PSObject.Properties['asOf']) { $raw.asOf } else { $null }
@@ -129,36 +143,63 @@ if ($IntentPath) {
         if ($null -eq $p.PSObject.Properties['complete']) {
             throw "L'entree '$label' ne porte pas de champ 'complete'. Il est obligatoire par principal."
         }
+        if ($p.complete -isnot [bool]) {
+            $intentNotResolved++
+            Add-Diagnostic 'Warning' 'IntentEntryMalformed' $label `
+                "'complete' doit etre un booleen JSON, pas $($p.complete.GetType().Name). Entree ignoree : une chaine n'est pas convertie."
+            continue
+        }
         if ($null -eq $p.PSObject.Properties['appId'] -or -not $p.appId -or $p.appId -match '^<') {
             $intentNotResolved++
             Add-Diagnostic 'Warning' 'IntentEntryNotResolved' $label "L'entree ne porte pas d'appId exploitable."
             continue
         }
 
-        $perms = @()
+        $perms    = @()
+        $malforme = $null
         if ($p.PSObject.Properties['permissions']) {
             foreach ($q in @($p.permissions)) {
+                if ($null -eq $q.PSObject.Properties['expectedGranted'] -or $q.expectedGranted -isnot [bool]) {
+                    $malforme = "$($q.resourceAppId)/$($q.value)"
+                    break
+                }
                 $perms += [pscustomobject]@{
                     ResourceAppId   = $q.resourceAppId
                     Value           = $q.value
-                    ExpectedGranted = [bool]$q.expectedGranted
+                    ExpectedGranted = $q.expectedGranted
                     Cle             = "$($q.resourceAppId)/$($q.value)"
                 }
             }
         }
-
-        if ($intentParAppId.ContainsKey($p.appId)) {
-            $intentDuplicates++
-            Add-Diagnostic 'Info' 'IntentEntryDuplicate' $label "Le principal apparait plus d'une fois dans le manifeste."
+        if ($malforme) {
+            # Un manifeste malforme sur un principal ne peut pas lui servir de
+            # reference. Ignorer l'entree entiere est la lecture prudente.
+            $intentNotResolved++
+            Add-Diagnostic 'Warning' 'IntentEntryMalformed' $label `
+                "La permission '$malforme' doit declarer 'expectedGranted' comme un booleen JSON. Entree ignoree."
             continue
         }
 
-        $intentParAppId[$p.appId] = [pscustomobject]@{
-            DisplayName      = $label
-            Complete         = [bool]$p.complete
-            Permissions      = @($perms)
+        $candidat = [pscustomobject]@{
+            DisplayName         = $label
+            Complete            = $p.complete
+            Permissions         = @($perms)
             PermissionsFournies = [bool]$p.PSObject.Properties['permissions']
         }
+
+        if ($intentParAppId.ContainsKey($p.appId)) {
+            # Un manifeste qui se contredit sur un principal ne peut pas lui
+            # servir de reference. Garder le premier en silence laisserait
+            # l'ordre des lignes trancher a la place de l'auteur.
+            if ((Get-SignatureEntree $intentParAppId[$p.appId]) -ne (Get-SignatureEntree $candidat)) {
+                throw "Le manifeste declare des attentes contradictoires pour '$label' ($($p.appId))."
+            }
+            $intentDuplicates++
+            Add-Diagnostic 'Info' 'IntentEntryDuplicate' $label "Le principal apparait plus d'une fois avec un contenu identique."
+            continue
+        }
+
+        $intentParAppId[$p.appId] = $candidat
     }
     # Seule la resolution au niveau du fichier est connue ici. La resolution
     # contre le tenant vient plus tard : l'annoncer maintenant afficherait un
@@ -248,7 +289,30 @@ foreach ($app in @(Get-MgApplication -All -Property 'id,appId,displayName,requir
 }
 Write-Host "$($declareParAppId.Count) inscription(s) locale(s)"
 
-# ── 4. Périmètre, et lectures individuelles ciblées ─────────────────────────
+# ── 4. Résolution des noms de rôles ─────────────────────────────────────────
+
+$rolesParAppId = @{}
+function Get-ValeurRole {
+    param([string]$ResourceAppId, [string]$RoleId)
+    if ($RoleId -eq $ROLE_NUL) { return '(attribue sans role specifique)' }
+    if (-not $rolesParAppId.ContainsKey($ResourceAppId)) {
+        $r = @(Get-MgServicePrincipal -Filter "appId eq '$ResourceAppId'" -Property 'id,appId,displayName,appRoles')
+        $rolesParAppId[$ResourceAppId] = if ($r.Count -eq 1) { $r[0] } else { $null }
+    }
+    $sp = $rolesParAppId[$ResourceAppId]
+    if (-not $sp) { return "(role $RoleId sur ressource $ResourceAppId absente du tenant)" }
+    $m = @($sp.AppRoles | Where-Object { $_.Id -eq $RoleId })
+    if ($m.Count -eq 0) { return "(role $RoleId non expose par $($sp.DisplayName))" }
+    $m[0].Value
+}
+
+function Get-AppIdRessource {
+    param([string]$ResourceSpId)
+    if (-not $spParSpId.ContainsKey($ResourceSpId)) { return "(sp $ResourceSpId inconnu)" }
+    $spParSpId[$ResourceSpId].AppId
+}
+
+# ── 5. Périmètre, et lectures individuelles ciblées ─────────────────────────
 #    Un principal entre dans le perimetre s'il porte des grants, s'il declare des
 #    permissions applicatives, ou s'il figure au manifeste. Une lecture
 #    individuelle n'est faite que la ou un zero porterait une conclusion.
@@ -317,8 +381,18 @@ foreach ($id in @($perimetre)) {
         if ($dejaRendu -and $complet.Count -ne $expandCompte[$id]) {
             $tronquees++
             $signale = $signauxImbriques.ContainsKey($id)
+            # Les deux jeux sont en main au moment ou l'ecart est detecte. Ne
+            # dire que le nombre laisse le lecteur devant une absence non
+            # identifiee : cinq roles peuvent etre en lecture seule ou
+            # Directory.ReadWrite.All. Etablir un ecart sans nommer sa portee est
+            # la faute que l'outil signale ailleurs, appliquee a son diagnostic.
+            $idsRendus = @($grantsParSpId[$id] | ForEach-Object { $_.Id })
+            $manquantes = @($complet | Where-Object { $_.Id -notin $idsRendus } | ForEach-Object {
+                Get-ValeurRole (Get-AppIdRessource $_.ResourceId) $_.AppRoleId
+            })
             Add-Diagnostic 'Warning' 'ExpandCollectionTruncated' $spParSpId[$id].DisplayName `
                 ("`$expand a rendu $($expandCompte[$id]) attribution(s) sur $($complet.Count) reelles. " +
+                 "Manquantes : $($manquantes -join ', '). " +
                  $(if ($signale) { "Graph a signale la suite : $($signauxImbriques[$id] | ConvertTo-Json -Compress)." }
                    else { "Aucun lien de continuation ni compte annonce dans la charge utile. Comportement documente : `$expand rend typiquement au maximum 20 elements pour une relation developpee sur une ressource derivant de directoryObject, sans @odata.nextLink. Voir learn.microsoft.com/graph/query-parameters#expand." }))
         }
@@ -344,29 +418,6 @@ foreach ($id in @($perimetre)) {
 Write-Host "$($perimetre.Count) principal(aux) dans le perimetre"
 Write-Host "$lecturesCiblees lecture(s) pour confirmer un zero, $lecturesCompletude pour verifier la completude"
 if ($tronquees -gt 0) { Write-Warning "$tronquees collection(s) `$expand tronquee(s)." }
-
-# ── 5. Résolution des noms de rôles ─────────────────────────────────────────
-
-$rolesParAppId = @{}
-function Get-ValeurRole {
-    param([string]$ResourceAppId, [string]$RoleId)
-    if ($RoleId -eq $ROLE_NUL) { return '(attribue sans role specifique)' }
-    if (-not $rolesParAppId.ContainsKey($ResourceAppId)) {
-        $r = @(Get-MgServicePrincipal -Filter "appId eq '$ResourceAppId'" -Property 'id,appId,displayName,appRoles')
-        $rolesParAppId[$ResourceAppId] = if ($r.Count -eq 1) { $r[0] } else { $null }
-    }
-    $sp = $rolesParAppId[$ResourceAppId]
-    if (-not $sp) { return "(role $RoleId sur ressource $ResourceAppId absente du tenant)" }
-    $m = @($sp.AppRoles | Where-Object { $_.Id -eq $RoleId })
-    if ($m.Count -eq 0) { return "(role $RoleId non expose par $($sp.DisplayName))" }
-    $m[0].Value
-}
-
-function Get-AppIdRessource {
-    param([string]$ResourceSpId)
-    if (-not $spParSpId.ContainsKey($ResourceSpId)) { return "(sp $ResourceSpId inconnu)" }
-    $spParSpId[$ResourceSpId].AppId
-}
 
 # ── 6. Matrice d'évaluation ─────────────────────────────────────────────────
 
@@ -702,4 +753,3 @@ if (Test-Path -LiteralPath $RegistrePath) {
 }
 
 Write-Host "`nRapport : $jsonPath"
-

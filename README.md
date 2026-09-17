@@ -96,7 +96,7 @@ Install-Module Microsoft.Graph.Applications   -RequiredVersion $v -Scope Current
 ## Usage
 
 ```powershell
-Connect-MgGraph -Scopes 'Application.Read.All','Directory.Read.All'
+Connect-MgGraph -Scopes 'Application.Read.All'
 
 # Without a manifest: reports grants as Observed and concludes at best
 # CoverageNotDemonstrable
@@ -121,7 +121,9 @@ For a principal that does have a registration, `permissions` is optional. If pre
 
 One exception, and it is structural. `requiredResourceAccess` is a positive-only declaration: the absence of an entry means "not declared", not "excluded". A negative expectation can therefore only come from the manifest, and it is honoured even when a registration exists. Without that rule `CorrectExclusion` is unreachable as soon as a registration exists.
 
-`complete` is mandatory at both levels and never inferred; its absence raises an error. There are two levels because a tenant holds many principals, not one group: `complete` on the manifest means the list of principals is exhaustive, `complete` on a principal means what is expected for that principal is complete.
+`complete` is mandatory at both levels, must be a JSON boolean, and is never inferred. A missing field raises an error; a wrong type is refused rather than coerced, because PowerShell reads the non-empty string `"false"` as `$true` and would silently invert the claim. The same check applies to `expectedGranted`.
+
+A principal declared twice with different content raises an error rather than resolving by line order: a manifest that contradicts itself about a principal cannot serve as its reference. Two identical entries are inert and reported as `IntentEntryDuplicate`. There are two levels because a tenant holds many principals, not one group: `complete` on the manifest means the list of principals is exhaustive, `complete` on a principal means what is expected for that principal is complete.
 
 Principals are keyed by `appId`, not `displayName`. An `appId` is stable across tenants and unambiguous; display names are not, and Microsoft first-party principals duplicate them.
 
@@ -141,7 +143,7 @@ The documented behaviour is at [learn.microsoft.com/graph/query-parameters#expan
 
 The tool therefore uses `$expand` to establish which principals hold grants, then re-reads individually every non-empty expanded collection, and issues a targeted read wherever a zero carries a conclusion. On a tenant of 305 principals that is four pages plus nine individual reads, against 305 in a naive enumeration. A repaired truncation is reported as `ExpandCollectionTruncated` and surfaced in `observation.expandCompleteness`.
 
-`ExpandCollectionTruncated` an expanded collection was incomplete and was repaired by an individual read.
+`ExpandCollectionTruncated` an expanded collection was incomplete and was repaired by an individual read. The diagnostic names the permissions that `$expand` had omitted: how many were missing does not tell a reader whether they were read-only roles or `Directory.ReadWrite.All`.
 `read.evaluatedWithoutRows` lists the principals in scope that produced no evaluation row, with the facts the engine holds about each: local registration, declared count, observed count, presence in the manifest. No taxonomy. Whether an object is a resource rather than a client is not among those facts — the engine reads neither `appRoles` nor `appRoleAssignedTo` — so saying so would be an inference drawn from its name.
 
 ## Diagnostics
@@ -150,6 +152,7 @@ The tool therefore uses `$expand` to establish which principals hold grants, the
 `GrantStateNotObserved` assignments could not be read for a principal in scope.
 `ManifestClaimsCompleteButOmitsGrantHolder` the manifest declares itself complete and omits a principal that holds assignments. The exhaustiveness claim is contradicted by the tenant.
 `ManifestDeclarationMismatch` the manifest and `requiredResourceAccess` disagree.
+`IntentEntryMalformed` an entry declared `complete` or `expectedGranted` as something other than a JSON boolean, and was skipped.
 `IntentEntryNotResolved`, `IntentEntryDuplicate`, `IntentPrincipalAbsent` manifest entries that could not be used.
 `DuplicateApplication` several local registrations carry the same `appId`.
 
