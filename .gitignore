@@ -9,3 +9,7 @@
 lab/agd-lab-out/
 
 *.tmp
+
+# One-off repair script for the lab observations file. Kept on disk, out of
+# the repository: it fixes a specific artefact, it is not corpus tooling.
+lab/agd-lab-marque-invalides.ps1
