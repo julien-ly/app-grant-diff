@@ -370,6 +370,7 @@ foreach ($appId in $intentParAppId.Keys) {
 $lecturesCiblees   = 0
 $lecturesCompletude = 0
 $tronquees         = 0
+$divergences         = 0
 $nonObserves = [System.Collections.Generic.List[string]]::new()
 # Principaux dont les attributions sont PRESENTES mais dont la completude n'a
 # pas pu etre verifiee, la relecture ayant echoue. Leurs grants observes sont
@@ -416,8 +417,31 @@ foreach ($id in @($perimetre)) {
     # vide. Le tableau vide vient d'une expression qui ne produit rien, pas d'une
     # valeur nulle. Le garde porte donc sur la presence de la cle, pas sur @().
     $idsAvant = if ($dejaRendu) { @($grantsParSpId[$id] | ForEach-Object { $_.Id }) } else { @() }
-    $etaitTronquee = $dejaRendu -and $complet.Count -ne $expandCompte[$id]
+    # Une difference de compte est un FAIT. La troncature en est une explication
+    # parmi d'autres : une attribution accordee ou revoquee entre les deux
+    # lectures en produit une aussi. On rapporte ce que chaque lecture contient,
+    # et on nomme la cause seulement quand la forme la soutient.
+    $idsComplet = @($complet | ForEach-Object { $_.Id })
+    $ajoutes    = @($complet | Where-Object { $_.Id -notin $idsAvant })
+    $retires    = @($idsAvant | Where-Object { $_ -notin $idsComplet })
+    $etaitTronquee     = $dejaRendu -and $ajoutes.Count -gt 0 -and $retires.Count -eq 0
+    $lecturesDivergent = $dejaRendu -and $retires.Count -gt 0
     $grantsParSpId[$id] = $complet
+
+    if ($lecturesDivergent) {
+        # Un element present a la premiere lecture manque a la seconde. Ce n'est
+        # pas une troncature, et le moteur ne peut pas distinguer une expansion
+        # plafonnee d'une revocation survenue entre les deux.
+        $divergences++
+        $libelles = foreach ($m in $ajoutes) {
+            try   { Get-ValeurRole (Get-AppIdRessource $m.ResourceId) $m.AppRoleId }
+            catch { "(appRoleId $($m.AppRoleId) sur ressource $($m.ResourceId))" }
+        }
+        Add-Diagnostic 'Warning' 'ExpandReadsDisagree' $spParSpId[$id].DisplayName `
+            ("La collection developpee portait $($expandCompte[$id]) attribution(s), la relecture $($complet.Count). " +
+             "$($ajoutes.Count) presente(s) seulement dans la relecture, $($retires.Count) seulement dans l'expansion. " +
+             "La cause n'est pas etablie : une expansion plafonnee et un changement entre les deux lectures produisent la meme difference. La relecture est retenue comme observation la plus recente.")
+    }
 
     if ($etaitTronquee) {
         $tronquees++
@@ -427,7 +451,7 @@ foreach ($id in @($perimetre)) {
         # identifiee : cinq roles peuvent etre en lecture seule ou
         # Directory.ReadWrite.All. Etablir un ecart sans nommer sa portee est
         # la faute que l'outil signale ailleurs, appliquee a son diagnostic.
-        $manquantes = foreach ($m in @($complet | Where-Object { $_.Id -notin $idsAvant })) {
+        $manquantes = foreach ($m in $ajoutes) {
             # Un nom qui ne resout pas ne doit pas couter l'identifiant.
             try   { Get-ValeurRole (Get-AppIdRessource $m.ResourceId) $m.AppRoleId }
             catch { "(appRoleId $($m.AppRoleId) sur ressource $($m.ResourceId))" }
@@ -461,6 +485,19 @@ if ($intentNotResolved -gt 0)                        { $completenessReasons.Add(
 # ce principal, et elle le dit qu'il produise une ligne ou non. Ne le deduire que
 # des lignes emises laisse un manifeste dont une entree renonce a l'exhaustivite
 # sortir en Complete, faute de ligne pour objecter.
+# Une entree qui revendique l'exhaustivite sans fournir d'ensemble attendu, pour
+# un principal sans inscription locale non plus, ne decrit rien. Son silence ne
+# doit pas se lire comme "rien n'est attendu".
+$sansReference = @($intentParAppId.GetEnumerator() |
+                   Where-Object { $_.Value.Complete -and -not $_.Value.PermissionsFournies `
+                                  -and -not $declareParAppId.ContainsKey($_.Key) } |
+                   ForEach-Object { $_.Value.DisplayName } | Sort-Object)
+if ($sansReference.Count -gt 0) {
+    $extraitRef = if ($sansReference.Count -le 5) { $sansReference -join ', ' }
+                  else { (@($sansReference)[0..4] -join ', ') + ", et $($sansReference.Count - 5) autre(s)" }
+    $completenessReasons.Add("$($sansReference.Count) entree(s) revendiquent l'exhaustivite sans fournir d'ensemble attendu, pour des principaux sans inscription locale : $extraitRef.")
+}
+
 $nonExhaustives = @($intentParAppId.Values | Where-Object { -not $_.Complete } |
                     ForEach-Object { $_.DisplayName } | Sort-Object)
 if ($nonExhaustives.Count -gt 0) {
@@ -491,7 +528,8 @@ foreach ($spId in @($perimetre)) {
     # Sans cette regle, CorrectExclusion est inatteignable des qu'une inscription
     # existe, et l'etat n'est jamais produit.
 
-    $attendu = @{}
+    $attendu       = @{}
+    $sourceAttendu = @{}
     $declarePositif = @{}
 
     if ($inscription) {
@@ -499,6 +537,7 @@ foreach ($spId in @($perimetre)) {
             $v = Get-ValeurRole $d.ResourceAppId $d.RoleId
             $declarePositif["$($d.ResourceAppId)/$v"] = $true
             $attendu["$($d.ResourceAppId)/$v"] = $true
+            $sourceAttendu["$($d.ResourceAppId)/$v"] = 'registration'
         }
     }
 
@@ -506,6 +545,7 @@ foreach ($spId in @($perimetre)) {
         foreach ($p in $entree.Permissions) {
             if (-not $inscription) {
                 $attendu[$p.Cle] = $p.ExpectedGranted
+                $sourceAttendu[$p.Cle] = 'intent'
             }
             elseif (-not $p.ExpectedGranted) {
                 if ($declarePositif.ContainsKey($p.Cle)) {
@@ -513,6 +553,7 @@ foreach ($spId in @($perimetre)) {
                         "Le manifeste declare '$($p.Cle)' explicitement non attendu alors que l'inscription la declare. L'inscription prevaut, la contradiction est signalee."
                 } else {
                     $attendu[$p.Cle] = $false
+                    $sourceAttendu[$p.Cle] = 'intent'
                 }
             }
         }
@@ -544,7 +585,14 @@ foreach ($spId in @($perimetre)) {
     # pour CE principal. Sans manifeste, ou sans entree, ou entree non exhaustive,
     # un grant sans contrepartie reste NotInManifest, ou Observed s'il n'y a
     # aucun manifeste du tout.
-    $overDemontrable = ($intentStatus -eq 'Available') -and $entree -and $entree.Complete -and ($intentNotResolved -eq 0)
+    # Un ensemble attendu n'a de SOURCE que si le manifeste a fourni permissions
+    # ou qu'une inscription locale existe. Sans l'un ni l'autre, l'ensemble vide
+    # signifie "rien n'a ete dit", pas "rien n'est attendu". Revendiquer
+    # l'exhaustivite ne cree pas une reference.
+    $attenduAUneSource = [bool]$inscription -or ($entree -and $entree.PermissionsFournies)
+
+    $overDemontrable = ($intentStatus -eq 'Available') -and $entree -and $entree.Complete `
+                       -and $attenduAUneSource -and ($intentNotResolved -eq 0)
 
     $aProduitNotInManifest = $false
 
@@ -582,7 +630,7 @@ foreach ($spId in @($perimetre)) {
             expectedGranted = $exp
             observedGranted = $obs
             state           = $state
-            source          = if ($null -eq $exp) { 'grant' } elseif ($inscription) { 'registration' } else { 'intent' }
+            source            = if ($null -eq $exp) { 'grant' } else { $sourceAttendu[$cle] }
             localRegistration = [bool]$inscription
         })
     }
@@ -593,7 +641,6 @@ foreach ($spId in @($perimetre)) {
     # ressource et non un client n'en fait pas partie : le moteur ne lit ni les
     # appRoles ni appRoleAssignedTo, le dire serait une inference tiree du nom.
     if ($evaluation.Count -eq $lignesAvant) {
-        $attenduAUneSource = $entree -and ($entree.PermissionsFournies -or $inscription)
         $estCorrectlyEmpty = ($intentStatus -eq 'Available') -and $entree -and $entree.Complete `
                              -and $attenduAUneSource -and ($attendu.Count -eq 0) -and ($observe.Count -eq 0)
         if ($estCorrectlyEmpty) { $correctlyEmptyCount++ }
@@ -667,7 +714,9 @@ $completeness = if ($intentStatus -eq 'Absent') { 'Absent' }
 # affirmee : elle n'est pas demontree.
 $observation = [pscustomobject]@{
     replicationIndicator = 'NotExposed'
-    expandCompleteness   = if ($tronquees -gt 0) { 'TruncatedAndRepaired' } else { 'NotContradicted' }
+    expandCompleteness   = if ($divergences -gt 0) { 'ReadsDisagree' }
+                           elseif ($tronquees -gt 0) { 'TruncatedAndRepaired' }
+                           else                      { 'NotContradicted' }
     freshness            = 'NotDemonstrated'
     note                 = 'Graph signale des delais de replication sur les attributions et n''expose aucun indicateur de convergence. Que l''instantane lu soit a jour n''a pas ete etabli.'
 }
@@ -732,6 +781,7 @@ $rapport = [pscustomobject]@{
         zeroConfirmingReads  = $lecturesCiblees
         completenessReads    = $lecturesCompletude
         expandTruncated      = $tronquees
+        expandReadsDisagree  = $divergences
         grantStateNotObserved = $nonObserves.Count
         grantCompletenessUnverified = $grantsNonVerifies.Count
         evaluatedWithoutRows        = $sansLigne.ToArray()

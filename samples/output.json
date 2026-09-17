@@ -1,7 +1,7 @@
 {
   "metadata": {
     "toolVersion": "1.0.0",
-    "generatedAt": "2026-09-17T09:34:02.5680777Z",
+    "generatedAt": "2026-09-17T10:32:44.6181553Z",
     "powerShellVersion": "7.6.6",
     "tenantId": "b58ec690-6b8a-4a87-8145-b34c83bda100",
     "disclaimer": "Conclusions are bounded to application permissions. Delegated permissions are not evaluated."
@@ -21,12 +21,13 @@
   "read": {
     "principalsTotal": 305,
     "expandPages": 4,
-    "expandDurationMs": 804,
+    "expandDurationMs": 839,
     "relationRendered": 4,
     "scopedPrincipals": 9,
     "zeroConfirmingReads": 5,
     "completenessReads": 4,
     "expandTruncated": 1,
+    "expandReadsDisagree": 0,
     "grantStateNotObserved": 0,
     "grantCompletenessUnverified": 0,
     "evaluatedWithoutRows": [
@@ -421,7 +422,7 @@
       "expectedGranted": false,
       "observedGranted": false,
       "state": "CorrectExclusion",
-      "source": "registration",
+      "source": "intent",
       "localRegistration": true
     }
   ],

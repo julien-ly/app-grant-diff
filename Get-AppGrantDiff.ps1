@@ -411,6 +411,7 @@ foreach ($appId in $intentByAppId.Keys) {
 $zeroConfirmingReads = 0
 $completenessReads   = 0
 $truncated           = 0
+$disagreements       = 0
 $notObserved = [System.Collections.Generic.List[string]]::new()
 # Principals whose grants are PRESENT but whose completeness could not be
 # verified, because the individual re-read failed. Their observed grants are
@@ -457,8 +458,31 @@ foreach ($id in @($scope)) {
     # vide. Le tableau vide vient d'une expression qui ne produit rien, pas d'une
     # valeur nulle. Le garde porte donc sur la presence de la cle, pas sur @().
     $priorIds = if ($alreadyRendered) { @($grantsBySpId[$id] | ForEach-Object { $_.Id }) } else { @() }
-    $wasTruncated = $alreadyRendered -and $full.Count -ne $expandCount[$id]
+    # A count difference is a FACT. Truncation is one explanation among several:
+    # an assignment granted or revoked between the two reads produces one too.
+    # Report what each read contains, and name the cause only when the shape
+    # supports it - nothing lost from the first, something present in the second.
+    $fullIds = @($full | ForEach-Object { $_.Id })
+    $added   = @($full | Where-Object { $_.Id -notin $priorIds })
+    $removed = @($priorIds | Where-Object { $_ -notin $fullIds })
+    $wasTruncated  = $alreadyRendered -and $added.Count -gt 0 -and $removed.Count -eq 0
+    $readsDisagree = $alreadyRendered -and $removed.Count -gt 0
     $grantsBySpId[$id] = $full
+
+    if ($readsDisagree) {
+        # Something present in the first read is absent from the second. That is
+        # not truncation, and the engine cannot tell a capped expansion from a
+        # revocation in between. State both directions, attribute nothing.
+        $disagreements++
+        $labels = foreach ($m in $added) {
+            try   { Get-RoleValue (Get-ResourceAppId $m.ResourceId) $m.AppRoleId }
+            catch { "(appRoleId $($m.AppRoleId) on resource $($m.ResourceId))" }
+        }
+        Add-Diagnostic 'Warning' 'ExpandReadsDisagree' $spBySpId[$id].DisplayName `
+            ("The expanded collection held $($expandCount[$id]) assignments, the individual re-read $($full.Count). " +
+             "$($added.Count) present only in the re-read$(if (@($labels).Count -gt 0) { ": $(@($labels) -join ', ')" }), $($removed.Count) only in the expansion. " +
+             'The cause is not established: a capped expansion and a change between the two reads produce the same difference. The re-read is retained as the later observation.')
+    }
 
     if ($wasTruncated) {
         $truncated++
@@ -468,7 +492,7 @@ foreach ($id in @($scope)) {
         # absence: five roles could be read-only or Directory.ReadWrite.All.
         # Establishing a gap without naming its scope is the same failure the
         # tool reports elsewhere, applied to its own diagnostic.
-        $missing = foreach ($m in @($full | Where-Object { $_.Id -notin $priorIds })) {
+        $missing = foreach ($m in $added) {
             # A name that will not resolve must not cost the identifier.
             try   { Get-RoleValue (Get-ResourceAppId $m.ResourceId) $m.AppRoleId }
             catch { "(appRoleId $($m.AppRoleId) on resource $($m.ResourceId))" }
@@ -501,6 +525,19 @@ if ($intentNotResolved -gt 0)                                { $completenessReas
 # that principal, and it says so whether or not the principal produced a row.
 # Deriving this only from emitted rows lets a manifest whose own entry disclaims
 # exhaustiveness be reported as Complete, because nothing was emitted to object.
+# An entry that claims exhaustiveness while supplying no expected set, for a
+# principal that has no local registration either, describes nothing. Silence
+# here must not read as "nothing is expected".
+$noReference = @($intentByAppId.GetEnumerator() |
+                 Where-Object { $_.Value.Complete -and -not $_.Value.PermissionsProvided `
+                                -and -not $declaredByAppId.ContainsKey($_.Key) } |
+                 ForEach-Object { $_.Value.DisplayName } | Sort-Object)
+if ($noReference.Count -gt 0) {
+    $excerptRef = if ($noReference.Count -le 5) { $noReference -join ', ' }
+                  else { (@($noReference)[0..4] -join ', ') + ", and $($noReference.Count - 5) more" }
+    $completenessReasons.Add("$($noReference.Count) manifest entries claim to be exhaustive without supplying an expected set, for principals with no local registration: $excerptRef.")
+}
+
 $notExhaustive = @($intentByAppId.Values | Where-Object { -not $_.Complete } |
                    ForEach-Object { $_.DisplayName } | Sort-Object)
 if ($notExhaustive.Count -gt 0) {
@@ -528,7 +565,12 @@ foreach ($spId in @($scope)) {
     # Without this rule CorrectExclusion is unreachable as soon as a
     # registration exists, and the state is never produced.
 
+    # The source travels with the expectation. Deriving it afterwards from the
+    # presence of a registration attributes to the registration what only the
+    # manifest can express: requiredResourceAccess has no way to say "explicitly
+    # not expected", so a false expectation is always the manifest's.
     $expected         = @{}
+    $expectedSource   = @{}
     $declaredPositive = @{}
 
     if ($registration) {
@@ -536,20 +578,23 @@ foreach ($spId in @($scope)) {
             $value = Get-RoleValue $d.ResourceAppId $d.RoleId
             $declaredPositive["$($d.ResourceAppId)/$value"] = $true
             $expected["$($d.ResourceAppId)/$value"] = $true
+            $expectedSource["$($d.ResourceAppId)/$value"] = 'registration'
         }
     }
 
     if ($entry -and $entry.PermissionsProvided) {
         foreach ($p in $entry.Permissions) {
             if (-not $registration) {
-                $expected[$p.Key] = $p.ExpectedGranted
+                $expected[$p.Key]       = $p.ExpectedGranted
+                $expectedSource[$p.Key] = 'intent'
             }
             elseif (-not $p.ExpectedGranted) {
                 if ($declaredPositive.ContainsKey($p.Key)) {
                     Add-Diagnostic 'Warning' 'ManifestDeclarationMismatch' $sp.DisplayName `
                         "The manifest declares '$($p.Key)' explicitly not expected while the registration declares it. The registration prevails; the contradiction is reported."
                 } else {
-                    $expected[$p.Key] = $false
+                    $expected[$p.Key]       = $false
+                    $expectedSource[$p.Key] = 'intent'
                 }
             }
         }
@@ -575,11 +620,19 @@ foreach ($spId in @($scope)) {
         $observed["$resourceAppId/$value"] = $true
     }
 
-    # Over-coverage is demonstrable only when an exhaustive reference exists for
-    # THIS principal. Without a manifest, without an entry, or with an entry that
-    # does not claim to be exhaustive, an unmatched grant stays NotInManifest, or
-    # Observed when there is no manifest at all.
-    $overDemonstrable = ($intentStatus -eq 'Available') -and $entry -and $entry.Complete -and ($intentNotResolved -eq 0)
+    # An expected set has a SOURCE only if the manifest supplied `permissions` or
+    # a local registration exists. Without either, the empty expected set means
+    # "nothing was said", not "nothing is expected" - the very distinction
+    # CorrectlyEmpty already makes. Claiming exhaustiveness does not create a
+    # reference, so over-coverage cannot be established against one that is absent.
+    $expectedHasSource = [bool]$registration -or ($entry -and $entry.PermissionsProvided)
+
+    # Over-coverage is demonstrable only when an exhaustive reference EXISTS for
+    # THIS principal. Without a manifest, without an entry, with an entry that
+    # does not claim to be exhaustive, or with no reference at all, an unmatched
+    # grant stays NotInManifest, or Observed when there is no manifest.
+    $overDemonstrable = ($intentStatus -eq 'Available') -and $entry -and $entry.Complete `
+                        -and $expectedHasSource -and ($intentNotResolved -eq 0)
 
     $producedNotInManifest = $false
 
@@ -618,7 +671,7 @@ foreach ($spId in @($scope)) {
             expectedGranted   = $exp
             observedGranted   = $obs
             state             = $state
-            source            = if ($null -eq $exp) { 'grant' } elseif ($registration) { 'registration' } else { 'intent' }
+            source            = if ($null -eq $exp) { 'grant' } else { $expectedSource[$key] }
             localRegistration = [bool]$registration
         })
     }
@@ -630,7 +683,6 @@ foreach ($spId in @($scope)) {
     # neither appRoles nor appRoleAssignedTo, so saying so would be an inference
     # drawn from its name.
     if ($evaluation.Count -eq $rowsBefore) {
-        $expectedHasSource = $entry -and ($entry.PermissionsProvided -or $registration)
         $isCorrectlyEmpty  = ($intentStatus -eq 'Available') -and $entry -and $entry.Complete `
                              -and $expectedHasSource -and ($expected.Count -eq 0) -and ($observed.Count -eq 0)
         if ($isCorrectlyEmpty) { $correctlyEmptyCount++ }
@@ -703,7 +755,9 @@ $completeness = if     ($intentStatus -eq 'Absent') { 'Absent' }
 
 $observation = [pscustomobject]@{
     replicationIndicator = 'NotExposed'
-    expandCompleteness   = if ($truncated -gt 0) { 'TruncatedAndRepaired' } else { 'NotContradicted' }
+    expandCompleteness   = if ($disagreements -gt 0) { 'ReadsDisagree' }
+                           elseif ($truncated -gt 0)  { 'TruncatedAndRepaired' }
+                           else                       { 'NotContradicted' }
     freshness            = 'NotDemonstrated'
     note                 = 'Microsoft Graph documents replication delays on app role assignments and exposes no convergence indicator. That the snapshot read is current has not been established.'
 }
@@ -770,6 +824,7 @@ $report = [pscustomobject]@{
         zeroConfirmingReads      = $zeroConfirmingReads
         completenessReads        = $completenessReads
         expandTruncated          = $truncated
+        expandReadsDisagree      = $disagreements
         grantStateNotObserved    = $notObserved.Count
         grantCompletenessUnverified = $grantsUnverified.Count
         evaluatedWithoutRows        = $withoutRows.ToArray()
