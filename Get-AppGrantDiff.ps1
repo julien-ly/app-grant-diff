@@ -218,21 +218,36 @@ if ($IntentPath) {
             continue
         }
 
-        $permissions = @()
-        $malformed   = $null
+        # Both booleans of a contradictory pair are individually valid, so type
+        # checking does not catch them. Without this, the last line of the entry
+        # wins and order decides the verdict - one level below the cross-entry
+        # check above.
+        $permissions   = @()
+        $malformed     = $null
+        $contradiction = $null
+        $seenKeys      = @{}
         if ($p.PSObject.Properties['permissions']) {
             foreach ($q in @($p.permissions)) {
                 if ($null -eq $q.PSObject.Properties['expectedGranted'] -or $q.expectedGranted -isnot [bool]) {
                     $malformed = "$($q.resourceAppId)/$($q.value)"
                     break
                 }
+                $key = "$($q.resourceAppId)/$($q.value)"
+                if ($seenKeys.ContainsKey($key)) {
+                    if ($seenKeys[$key] -ne $q.expectedGranted) { $contradiction = $key; break }
+                    continue   # identical repeat: inert
+                }
+                $seenKeys[$key] = $q.expectedGranted
                 $permissions += [pscustomobject]@{
                     ResourceAppId   = $q.resourceAppId
                     Value           = $q.value
                     ExpectedGranted = $q.expectedGranted
-                    Key             = "$($q.resourceAppId)/$($q.value)"
+                    Key             = $key
                 }
             }
+        }
+        if ($contradiction) {
+            throw "Intent entry '$label' declares contradictory expectations for permission '$contradiction'."
         }
         if ($malformed) {
             # A manifest malformed about a principal cannot serve as its
@@ -413,38 +428,17 @@ foreach ($id in @($scope)) {
         $zeroConfirmingReads++
     }
 
+    # The try covers the READ and nothing else. Resolving role names calls Graph
+    # too, and a failure there is a failure to label, not a failure to read.
+    # Leaving both under one catch made a successful re-read report itself as
+    # failed, kept the truncated collection, and still claimed a repair.
+    $full = $null
     try {
         $full = @(@(Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $id -All) | ForEach-Object {
             [pscustomobject]@{ Id = $_.Id; AppRoleId = $_.AppRoleId; ResourceId = $_.ResourceId }
         })
-
-        if ($alreadyRendered -and $full.Count -ne $expandCount[$id]) {
-            $truncated++
-            $signalled = $nestedSignals.ContainsKey($id)
-            # Both sets are in hand at the moment the gap is detected. Reporting
-            # only how many were missing leaves the reader with an unidentified
-            # absence: five roles could be read-only or Directory.ReadWrite.All.
-            # Establishing a gap without naming its scope is the same failure the
-            # tool reports elsewhere, applied to its own diagnostic.
-            $renderedIds = @($grantsBySpId[$id] | ForEach-Object { $_.Id })
-            $missing = @($full | Where-Object { $_.Id -notin $renderedIds } | ForEach-Object {
-                Get-RoleValue (Get-ResourceAppId $_.ResourceId) $_.AppRoleId
-            })
-            Add-Diagnostic 'Warning' 'ExpandCollectionTruncated' $spBySpId[$id].DisplayName `
-                ("`$expand returned $($expandCount[$id]) assignments out of $($full.Count) actual. " +
-                 "Missing: $($missing -join ', '). " +
-                 $(if ($signalled) { "Graph announced the rest: $($nestedSignals[$id] | ConvertTo-Json -Compress)." }
-                   else { 'No continuation link and no announced count in the payload. Documented behaviour: $expand returns at most 20 items for an expanded relationship on a directoryObject-derived resource, with no @odata.nextLink. See learn.microsoft.com/graph/query-parameters#expand.' }))
-        }
-
-        $grantsBySpId[$id] = $full
     } catch {
         if ($alreadyRendered) {
-            # The expanded collection stands as evidence of presence. It cannot
-            # stand as evidence of absence: $expand caps expanded relationships,
-            # so a permission missing from it may exist and not have been
-            # returned. Keeping the grants and evaluating absences against them
-            # would turn an unverified state into an observed one.
             [void]$grantsUnverified.Add($id)
             Add-Diagnostic 'Warning' 'CompletenessNotVerified' $spBySpId[$id].DisplayName `
                 "Re-read failed, the `$expand result could not be verified, so its completeness is unknown: $($_.Exception.Message)"
@@ -453,6 +447,38 @@ foreach ($id in @($scope)) {
             Add-Diagnostic 'Error' 'GrantStateNotObserved' $spBySpId[$id].DisplayName `
                 "Assignments could not be read: $($_.Exception.Message)"
         }
+        continue
+    }
+
+    # The read succeeded. Record it before anything else, so that no later
+    # failure can cost the evidence already acquired.
+    # Ne rien piper quand la cle est absente. @() ne neutralise PAS une valeur
+    # nulle : @($null) rend un tableau d'UN element valant $null, pas un tableau
+    # vide. Le tableau vide vient d'une expression qui ne produit rien, pas d'une
+    # valeur nulle. Le garde porte donc sur la presence de la cle, pas sur @().
+    $priorIds = if ($alreadyRendered) { @($grantsBySpId[$id] | ForEach-Object { $_.Id }) } else { @() }
+    $wasTruncated = $alreadyRendered -and $full.Count -ne $expandCount[$id]
+    $grantsBySpId[$id] = $full
+
+    if ($wasTruncated) {
+        $truncated++
+        $signalled = $nestedSignals.ContainsKey($id)
+        # Both sets are in hand at the moment the gap is detected. Reporting
+        # only how many were missing leaves the reader with an unidentified
+        # absence: five roles could be read-only or Directory.ReadWrite.All.
+        # Establishing a gap without naming its scope is the same failure the
+        # tool reports elsewhere, applied to its own diagnostic.
+        $missing = foreach ($m in @($full | Where-Object { $_.Id -notin $priorIds })) {
+            # A name that will not resolve must not cost the identifier.
+            try   { Get-RoleValue (Get-ResourceAppId $m.ResourceId) $m.AppRoleId }
+            catch { "(appRoleId $($m.AppRoleId) on resource $($m.ResourceId))" }
+        }
+        $missing = @($missing)
+        Add-Diagnostic 'Warning' 'ExpandCollectionTruncated' $spBySpId[$id].DisplayName `
+            ("`$expand returned $($expandCount[$id]) assignments out of $($full.Count) actual. " +
+             "Missing: $($missing -join ', '). " +
+             $(if ($signalled) { "Graph announced the rest: $($nestedSignals[$id] | ConvertTo-Json -Compress)." }
+               else { 'No continuation link and no announced count in the payload. Documented behaviour: $expand returns at most 20 items for an expanded relationship on a directoryObject-derived resource, with no @odata.nextLink. See learn.microsoft.com/graph/query-parameters#expand.' }))
     }
 }
 Write-Line "$($scope.Count) principals in scope"

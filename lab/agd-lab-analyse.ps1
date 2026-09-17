@@ -155,21 +155,36 @@ if ($IntentPath) {
             continue
         }
 
-        $perms    = @()
-        $malforme = $null
+        # Les deux booleens d'une paire contradictoire sont valides pris un a un,
+        # donc la verification de type ne les attrape pas. Sans ce controle, la
+        # derniere ligne de l'entree gagne et l'ordre decide du verdict, un cran
+        # sous le controle inter-entrees ci-dessus.
+        $perms         = @()
+        $malforme      = $null
+        $contradiction = $null
+        $clesVues      = @{}
         if ($p.PSObject.Properties['permissions']) {
             foreach ($q in @($p.permissions)) {
                 if ($null -eq $q.PSObject.Properties['expectedGranted'] -or $q.expectedGranted -isnot [bool]) {
                     $malforme = "$($q.resourceAppId)/$($q.value)"
                     break
                 }
+                $cle = "$($q.resourceAppId)/$($q.value)"
+                if ($clesVues.ContainsKey($cle)) {
+                    if ($clesVues[$cle] -ne $q.expectedGranted) { $contradiction = $cle; break }
+                    continue
+                }
+                $clesVues[$cle] = $q.expectedGranted
                 $perms += [pscustomobject]@{
                     ResourceAppId   = $q.resourceAppId
                     Value           = $q.value
                     ExpectedGranted = $q.expectedGranted
-                    Cle             = "$($q.resourceAppId)/$($q.value)"
+                    Cle             = $cle
                 }
             }
+        }
+        if ($contradiction) {
+            throw "L'entree '$label' declare des attentes contradictoires pour la permission '$contradiction'."
         }
         if ($malforme) {
             # Un manifeste malforme sur un principal ne peut pas lui servir de
@@ -372,39 +387,17 @@ foreach ($id in @($perimetre)) {
         $lecturesCiblees++
     }
 
+    # Le try ne couvre que la LECTURE. Resoudre les noms de roles appelle Graph
+    # aussi, et un echec la est un echec d'etiquetage, pas de lecture. Les laisser
+    # sous un meme catch faisait declarer echouee une relecture reussie, gardait
+    # la collection tronquee, et annoncait quand meme une reparation.
+    $complet = $null
     try {
-        $g = @(Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $id -All)
-        $complet = @($g | ForEach-Object {
+        $complet = @(@(Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $id -All) | ForEach-Object {
             [pscustomobject]@{ Id = $_.Id; AppRoleId = $_.AppRoleId; ResourceId = $_.ResourceId }
         })
-
-        if ($dejaRendu -and $complet.Count -ne $expandCompte[$id]) {
-            $tronquees++
-            $signale = $signauxImbriques.ContainsKey($id)
-            # Les deux jeux sont en main au moment ou l'ecart est detecte. Ne
-            # dire que le nombre laisse le lecteur devant une absence non
-            # identifiee : cinq roles peuvent etre en lecture seule ou
-            # Directory.ReadWrite.All. Etablir un ecart sans nommer sa portee est
-            # la faute que l'outil signale ailleurs, appliquee a son diagnostic.
-            $idsRendus = @($grantsParSpId[$id] | ForEach-Object { $_.Id })
-            $manquantes = @($complet | Where-Object { $_.Id -notin $idsRendus } | ForEach-Object {
-                Get-ValeurRole (Get-AppIdRessource $_.ResourceId) $_.AppRoleId
-            })
-            Add-Diagnostic 'Warning' 'ExpandCollectionTruncated' $spParSpId[$id].DisplayName `
-                ("`$expand a rendu $($expandCompte[$id]) attribution(s) sur $($complet.Count) reelles. " +
-                 "Manquantes : $($manquantes -join ', '). " +
-                 $(if ($signale) { "Graph a signale la suite : $($signauxImbriques[$id] | ConvertTo-Json -Compress)." }
-                   else { "Aucun lien de continuation ni compte annonce dans la charge utile. Comportement documente : `$expand rend typiquement au maximum 20 elements pour une relation developpee sur une ressource derivant de directoryObject, sans @odata.nextLink. Voir learn.microsoft.com/graph/query-parameters#expand." }))
-        }
-
-        $grantsParSpId[$id] = $complet
     } catch {
         if ($dejaRendu) {
-            # La collection developpee vaut preuve de PRESENCE. Elle ne vaut pas
-            # preuve d'absence : $expand plafonne les relations developpees, donc
-            # une permission absente du resultat peut exister sans avoir ete
-            # rendue. Garder les grants et evaluer les absences contre eux
-            # transformerait un etat non verifie en etat observe.
             [void]$grantsNonVerifies.Add($id)
             Add-Diagnostic 'Warning' 'CompletenessNotVerified' $spParSpId[$id].DisplayName `
                 "Relecture impossible, le resultat `$expand n'a pas pu etre verifie, sa completude est inconnue : $($_.Exception.Message)"
@@ -413,8 +406,41 @@ foreach ($id in @($perimetre)) {
             Add-Diagnostic 'Error' 'GrantStateNotObserved' $spParSpId[$id].DisplayName `
                 "Lecture des attributions impossible : $($_.Exception.Message)"
         }
+        continue
+    }
+
+    # La lecture a reussi. On l'enregistre avant tout le reste, pour qu'aucun
+    # echec ulterieur ne coute la preuve deja acquise.
+    # Ne rien piper quand la cle est absente. @() ne neutralise PAS une valeur
+    # nulle : @($null) rend un tableau d'UN element valant $null, pas un tableau
+    # vide. Le tableau vide vient d'une expression qui ne produit rien, pas d'une
+    # valeur nulle. Le garde porte donc sur la presence de la cle, pas sur @().
+    $idsAvant = if ($dejaRendu) { @($grantsParSpId[$id] | ForEach-Object { $_.Id }) } else { @() }
+    $etaitTronquee = $dejaRendu -and $complet.Count -ne $expandCompte[$id]
+    $grantsParSpId[$id] = $complet
+
+    if ($etaitTronquee) {
+        $tronquees++
+        $signale = $signauxImbriques.ContainsKey($id)
+        # Les deux jeux sont en main au moment ou l'ecart est detecte. Ne
+        # dire que le nombre laisse le lecteur devant une absence non
+        # identifiee : cinq roles peuvent etre en lecture seule ou
+        # Directory.ReadWrite.All. Etablir un ecart sans nommer sa portee est
+        # la faute que l'outil signale ailleurs, appliquee a son diagnostic.
+        $manquantes = foreach ($m in @($complet | Where-Object { $_.Id -notin $idsAvant })) {
+            # Un nom qui ne resout pas ne doit pas couter l'identifiant.
+            try   { Get-ValeurRole (Get-AppIdRessource $m.ResourceId) $m.AppRoleId }
+            catch { "(appRoleId $($m.AppRoleId) sur ressource $($m.ResourceId))" }
+        }
+        $manquantes = @($manquantes)
+        Add-Diagnostic 'Warning' 'ExpandCollectionTruncated' $spParSpId[$id].DisplayName `
+            ("`$expand a rendu $($expandCompte[$id]) attribution(s) sur $($complet.Count) reelles. " +
+             "Manquantes : $($manquantes -join ', '). " +
+             $(if ($signale) { "Graph a signale la suite : $($signauxImbriques[$id] | ConvertTo-Json -Compress)." }
+               else { "Aucun lien de continuation ni compte annonce dans la charge utile. Comportement documente : `$expand rend typiquement au maximum 20 elements pour une relation developpee sur une ressource derivant de directoryObject, sans @odata.nextLink. Voir learn.microsoft.com/graph/query-parameters#expand." }))
     }
 }
+
 Write-Host "$($perimetre.Count) principal(aux) dans le perimetre"
 Write-Host "$lecturesCiblees lecture(s) pour confirmer un zero, $lecturesCompletude pour verifier la completude"
 if ($tronquees -gt 0) { Write-Warning "$tronquees collection(s) `$expand tronquee(s)." }
