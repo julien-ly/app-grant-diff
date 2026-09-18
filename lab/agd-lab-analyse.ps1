@@ -380,8 +380,8 @@ foreach ($appId in $intentParAppId.Keys) {
 
 $lecturesCiblees   = 0
 $lecturesCompletude = 0
-$tronquees         = 0
-$divergences         = 0
+$differences        = 0
+$compatiblesPlafond  = 0
 $nonObserves = [System.Collections.Generic.List[string]]::new()
 # Principaux dont les attributions sont PRESENTES mais dont la completude n'a
 # pas pu etre verifiee, la relecture ayant echoue. Leurs grants observes sont
@@ -435,68 +435,47 @@ foreach ($id in @($perimetre)) {
     $idsComplet = @($complet | ForEach-Object { $_.Id })
     $ajoutes    = @($complet | Where-Object { $_.Id -notin $idsAvant })
     $retires    = @($idsAvant | Where-Object { $_ -notin $idsComplet })
-    # Des ajouts seuls n'etablissent pas une troncature : une attribution
-    # accordee entre les deux lectures produit la meme forme. Le discriminant est
-    # le plafond documente : une expansion ne peut pas avoir ete plafonnee EN
-    # DESSOUS du plafond. Vingt rendus est compatible, trois ne l'est pas.
+    # UN seul code, et il nomme la difference et non sa cause.
+    # ExpandCollectionTruncated affirmait la troncature ; au plafond documente,
+    # une attribution accordee entre les deux lectures produit exactement la meme
+    # forme, et deux lectures ne les separent pas. Meme « incomplete » affirmerait :
+    # si le grant est venu apres, l'expansion etait complete au moment de la prise.
+    # consistentWithDocumentedCap dit ce que le plafond peut expliquer.
+    # causeEstablished dit que ce n'est pas etabli.
     $auPlafondDocumente = $dejaRendu -and $expandCompte[$id] -ge $ExpandItemCap
-    $etaitTronquee     = $dejaRendu -and $ajoutes.Count -gt 0 -and $retires.Count -eq 0 -and $auPlafondDocumente
-    $lecturesDivergent = $dejaRendu -and ($retires.Count -gt 0 -or ($ajoutes.Count -gt 0 -and -not $auPlafondDocumente))
+    $lecturesDifferent = $dejaRendu -and ($ajoutes.Count -gt 0 -or $retires.Count -gt 0)
     $grantsParSpId[$id] = $complet
 
-    if ($lecturesDivergent) {
-        # Un element present a la premiere lecture manque a la seconde. Ce n'est
-        # pas une troncature, et le moteur ne peut pas distinguer une expansion
-        # plafonnee d'une revocation survenue entre les deux.
-        $divergences++
+    if ($lecturesDifferent) {
+        $differences++
+        if ($auPlafondDocumente -and $retires.Count -eq 0) { $compatiblesPlafond++ }
+        $signalled = $signauxImbriques.ContainsKey($id)
         $libelles = foreach ($m in $ajoutes) {
-            try   { Get-ValeurRole (Get-AppIdRessource $m.ResourceId) $m.AppRoleId }
-            catch { "(appRoleId $($m.AppRoleId) sur ressource $($m.ResourceId))" }
-        }
-        Add-Diagnostic 'Warning' 'ExpandReadsDisagree' $spParSpId[$id].DisplayName `
-            "Les deux lectures divergent : $($expandCompte[$id]) developpees, $($complet.Count) a la relecture." `
-            ([ordered]@{
-                expanded             = $expandCompte[$id]
-                actual               = $complet.Count
-                onlyInReRead         = @($libelles)
-                onlyInExpansionCount = $retires.Count
-                causeEstablished     = $false
-                note                 = 'Le plafond documente n''explique pas cette difference, ou un element present dans l''expansion manque a la relecture. Un changement entre les deux lectures produit la meme forme. La relecture est retenue comme observation la plus recente.'
-            })
-    }
-
-    if ($etaitTronquee) {
-        $tronquees++
-        $signale = $signauxImbriques.ContainsKey($id)
-        # Les deux jeux sont en main au moment ou l'ecart est detecte. Ne
-        # dire que le nombre laisse le lecteur devant une absence non
-        # identifiee : cinq roles peuvent etre en lecture seule ou
-        # Directory.ReadWrite.All. Etablir un ecart sans nommer sa portee est
-        # la faute que l'outil signale ailleurs, appliquee a son diagnostic.
-        $manquantes = foreach ($m in $ajoutes) {
             # Un nom qui ne resout pas ne doit pas couter l'identifiant.
             try   { Get-ValeurRole (Get-AppIdRessource $m.ResourceId) $m.AppRoleId }
             catch { "(appRoleId $($m.AppRoleId) sur ressource $($m.ResourceId))" }
         }
-        $manquantes = @($manquantes)
-        Add-Diagnostic 'Warning' 'ExpandCollectionTruncated' $spParSpId[$id].DisplayName `
-            "`$expand a rendu $($expandCompte[$id]) attribution(s) sur $($complet.Count) reelles." `
+        Add-Diagnostic 'Warning' 'ExpandCollectionDiffers' $spParSpId[$id].DisplayName `
+            "`$expand a rendu $($expandCompte[$id]) attribution(s), la relecture $($complet.Count)." `
             ([ordered]@{
-                expanded      = $expandCompte[$id]
-                actual        = $complet.Count
-                missing       = @($manquantes)
-                consistentWithDocumentedCap = $true
-                payloadSignal = if ($signale) { $signauxImbriques[$id] }
+                expanded  = $expandCompte[$id]
+                actual    = $complet.Count
+                onlyInReRead = @($libelles)
+                onlyInExpansionCount = $retires.Count
+                consistentWithDocumentedCap = [bool]($auPlafondDocumente -and $retires.Count -eq 0)
+                causeEstablished = $false
+                payloadSignal = if ($signalled) { $signauxImbriques[$id] }
                                 else { 'Aucun lien de continuation ni compte annonce.' }
-                documented    = 'Au maximum 20 elements sont rendus pour une relation developpee sur une ressource derivant de directoryObject, sans @odata.nextLink.'
-                reference     = 'https://learn.microsoft.com/graph/query-parameters#expand'
+                documented = 'Au maximum 20 elements sont rendus pour une relation developpee sur une ressource derivant de directoryObject, sans @odata.nextLink.'
+                reference  = 'https://learn.microsoft.com/graph/query-parameters#expand'
+                note       = 'Les deux lectures divergent. Une expansion plafonnee et un changement entre les deux lectures produisent la meme difference, et deux lectures ne permettent pas de les separer. La relecture est retenue comme observation la plus recente.'
             })
     }
 }
 
 Write-Host "$($perimetre.Count) principal(aux) dans le perimetre"
 Write-Host "$lecturesCiblees lecture(s) pour confirmer un zero, $lecturesCompletude pour verifier la completude"
-if ($tronquees -gt 0) { Write-Warning "$tronquees collection(s) `$expand tronquee(s)." }
+if ($differences -gt 0) { Write-Warning "$differences collection(s) developpee(s) different de la relecture, dont $compatiblesPlafond compatibles avec le plafond documente." }
 
 # ── 6. Matrice d'évaluation ─────────────────────────────────────────────────
 
@@ -743,9 +722,7 @@ $completeness = if ($intentStatus -eq 'Absent') { 'Absent' }
 # affirmee : elle n'est pas demontree.
 $observation = [pscustomobject]@{
     replicationIndicator = 'NotExposed'
-    expandCompleteness   = if ($divergences -gt 0) { 'ReadsDisagree' }
-                           elseif ($tronquees -gt 0) { 'TruncatedAndRepaired' }
-                           else                      { 'NotContradicted' }
+    expandCompleteness   = if ($differences -gt 0) { 'ReadsDiffered' } else { 'NotContradicted' }
     freshness            = 'NotDemonstrated'
     note                 = 'Graph signale des delais de replication sur les attributions et n''expose aucun indicateur de convergence. Que l''instantane lu soit a jour n''a pas ete etabli.'
 }
@@ -809,8 +786,8 @@ $rapport = [pscustomobject]@{
         scopedPrincipals     = $perimetre.Count
         zeroConfirmingReads  = $lecturesCiblees
         completenessReads    = $lecturesCompletude
-        expandTruncated      = $tronquees
-        expandReadsDisagree  = $divergences
+        expandCollectionsDiffered    = $differences
+        differencesConsistentWithCap = $compatiblesPlafond
         grantStateNotObserved = $nonObserves.Count
         grantCompletenessUnverified = $grantsNonVerifies.Count
         evaluatedWithoutRows        = $sansLigne.ToArray()

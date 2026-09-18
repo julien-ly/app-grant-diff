@@ -1,7 +1,7 @@
 {
   "metadata": {
     "toolVersion": "1.0.0",
-    "generatedAt": "2026-09-18T07:40:11.2668555Z",
+    "generatedAt": "2026-09-18T07:59:30.0300549Z",
     "powerShellVersion": "7.6.6",
     "tenantId": "b58ec690-6b8a-4a87-8145-b34c83bda100",
     "disclaimer": "Conclusions are bounded to application permissions. Delegated permissions are not evaluated."
@@ -21,13 +21,13 @@
   "read": {
     "principalsTotal": 305,
     "expandPages": 4,
-    "expandDurationMs": 865,
+    "expandDurationMs": 805,
     "relationRendered": 4,
     "scopedPrincipals": 9,
     "zeroConfirmingReads": 5,
     "completenessReads": 4,
-    "expandTruncated": 1,
-    "expandReadsDisagree": 0,
+    "expandCollectionsDiffered": 1,
+    "differencesConsistentWithCap": 1,
     "grantStateNotObserved": 0,
     "grantCompletenessUnverified": 0,
     "evaluatedWithoutRows": [
@@ -446,7 +446,7 @@
   },
   "observation": {
     "replicationIndicator": "NotExposed",
-    "expandCompleteness": "TruncatedAndRepaired",
+    "expandCompleteness": "ReadsDiffered",
     "freshness": "NotDemonstrated",
     "note": "Microsoft Graph documents replication delays on app role assignments and exposes no convergence indicator. That the snapshot read is current has not been established."
   },
@@ -459,23 +459,26 @@
   "diagnostics": [
     {
       "severity": "Warning",
-      "code": "ExpandCollectionTruncated",
+      "code": "ExpandCollectionDiffers",
       "object": "agd-lab-g-troncature",
-      "message": "$expand returned 20 assignments out of 25 actual.",
+      "message": "$expand returned 20 assignments, the individual re-read 25.",
       "details": {
         "expanded": 20,
         "actual": 25,
-        "missing": [
+        "onlyInReRead": [
           "AgdLab.Trunc.18",
           "AgdLab.Trunc.16",
           "AgdLab.Trunc.10",
           "AgdLab.Trunc.20",
           "AgdLab.Trunc.15"
         ],
+        "onlyInExpansionCount": 0,
         "consistentWithDocumentedCap": true,
+        "causeEstablished": false,
         "payloadSignal": "No continuation link and no announced count.",
         "documented": "At most 20 items are returned for an expanded relationship on a directoryObject-derived resource, with no @odata.nextLink.",
-        "reference": "https://learn.microsoft.com/graph/query-parameters#expand"
+        "reference": "https://learn.microsoft.com/graph/query-parameters#expand",
+        "note": "The two reads disagree. A capped expansion and a change between the two reads produce the same difference, and two reads cannot tell them apart. The re-read is retained as the later observation."
       }
     }
   ]

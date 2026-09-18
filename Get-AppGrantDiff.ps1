@@ -421,8 +421,8 @@ foreach ($appId in $intentByAppId.Keys) {
 
 $zeroConfirmingReads = 0
 $completenessReads   = 0
-$truncated           = 0
-$disagreements       = 0
+$differed            = 0
+$capConsistent       = 0
 $notObserved = [System.Collections.Generic.List[string]]::new()
 # Principals whose grants are PRESENT but whose completeness could not be
 # verified, because the individual re-read failed. Their observed grants are
@@ -476,67 +476,46 @@ foreach ($id in @($scope)) {
     $fullIds = @($full | ForEach-Object { $_.Id })
     $added   = @($full | Where-Object { $_.Id -notin $priorIds })
     $removed = @($priorIds | Where-Object { $_ -notin $fullIds })
-    # Additions alone do not establish truncation: an assignment granted between
-    # the two reads produces the same shape. The discriminator is the documented
-    # cap - an expansion cannot have been capped BELOW the cap. Twenty returned
-    # is consistent with truncation; three returned is not, whatever came after.
+    # ONE code, and it names the difference rather than its cause.
+    # ExpandCollectionTruncated asserted truncation; at the documented cap, an
+    # assignment granted between the two reads produces exactly the same shape,
+    # and two reads cannot separate them. Even 'incomplete' would assert: if the
+    # grant came after, the expansion was complete when it was taken.
+    # consistentWithDocumentedCap says what the cap can explain.
+    # causeEstablished says it is not established.
     $atDocumentedCap = $alreadyRendered -and $expandCount[$id] -ge $ExpandItemCap
-    $wasTruncated  = $alreadyRendered -and $added.Count -gt 0 -and $removed.Count -eq 0 -and $atDocumentedCap
-    $readsDisagree = $alreadyRendered -and ($removed.Count -gt 0 -or ($added.Count -gt 0 -and -not $atDocumentedCap))
+    $readsDiffer = $alreadyRendered -and ($added.Count -gt 0 -or $removed.Count -gt 0)
     $grantsBySpId[$id] = $full
 
-    if ($readsDisagree) {
-        # Something present in the first read is absent from the second. That is
-        # not truncation, and the engine cannot tell a capped expansion from a
-        # revocation in between. State both directions, attribute nothing.
-        $disagreements++
-        $labels = foreach ($m in $added) {
-            try   { Get-RoleValue (Get-ResourceAppId $m.ResourceId) $m.AppRoleId }
-            catch { "(appRoleId $($m.AppRoleId) on resource $($m.ResourceId))" }
-        }
-        Add-Diagnostic 'Warning' 'ExpandReadsDisagree' $spBySpId[$id].DisplayName `
-            "The two reads disagree: $($expandCount[$id]) assignments expanded, $($full.Count) on re-read." `
-            ([ordered]@{
-                expanded             = $expandCount[$id]
-                actual               = $full.Count
-                onlyInReRead         = @($labels)
-                onlyInExpansionCount = $removed.Count
-                causeEstablished     = $false
-                note                 = 'The documented cap cannot explain this difference, or something present in the expansion is absent from the re-read. A change between the two reads produces the same shape. The re-read is retained as the later observation.'
-            })
-    }
-
-    if ($wasTruncated) {
-        $truncated++
+    if ($readsDiffer) {
+        $differed++
+        if ($atDocumentedCap -and $removed.Count -eq 0) { $capConsistent++ }
         $signalled = $nestedSignals.ContainsKey($id)
-        # Both sets are in hand at the moment the gap is detected. Reporting
-        # only how many were missing leaves the reader with an unidentified
-        # absence: five roles could be read-only or Directory.ReadWrite.All.
-        # Establishing a gap without naming its scope is the same failure the
-        # tool reports elsewhere, applied to its own diagnostic.
-        $missing = foreach ($m in $added) {
+        $labels = foreach ($m in $added) {
             # A name that will not resolve must not cost the identifier.
             try   { Get-RoleValue (Get-ResourceAppId $m.ResourceId) $m.AppRoleId }
             catch { "(appRoleId $($m.AppRoleId) on resource $($m.ResourceId))" }
         }
-        $missing = @($missing)
-        Add-Diagnostic 'Warning' 'ExpandCollectionTruncated' $spBySpId[$id].DisplayName `
-            "`$expand returned $($expandCount[$id]) assignments out of $($full.Count) actual." `
+        Add-Diagnostic 'Warning' 'ExpandCollectionDiffers' $spBySpId[$id].DisplayName `
+            "`$expand returned $($expandCount[$id]) assignments, the individual re-read $($full.Count)." `
             ([ordered]@{
-                expanded      = $expandCount[$id]
-                actual        = $full.Count
-                missing       = @($missing)
-                consistentWithDocumentedCap = $true
+                expanded  = $expandCount[$id]
+                actual    = $full.Count
+                onlyInReRead = @($labels)
+                onlyInExpansionCount = $removed.Count
+                consistentWithDocumentedCap = [bool]($atDocumentedCap -and $removed.Count -eq 0)
+                causeEstablished = $false
                 payloadSignal = if ($signalled) { $nestedSignals[$id] }
                                 else { 'No continuation link and no announced count.' }
-                documented    = 'At most 20 items are returned for an expanded relationship on a directoryObject-derived resource, with no @odata.nextLink.'
-                reference     = 'https://learn.microsoft.com/graph/query-parameters#expand'
+                documented = 'At most 20 items are returned for an expanded relationship on a directoryObject-derived resource, with no @odata.nextLink.'
+                reference  = 'https://learn.microsoft.com/graph/query-parameters#expand'
+                note       = 'The two reads disagree. A capped expansion and a change between the two reads produce the same difference, and two reads cannot tell them apart. The re-read is retained as the later observation.'
             })
     }
 }
 Write-Line "$($scope.Count) principals in scope"
 Write-Line "$zeroConfirmingReads reads to confirm a zero, $completenessReads to verify completeness"
-if ($truncated -gt 0 -and -not $Quiet) { Write-Warning "$truncated `$expand collection(s) truncated." }
+if ($differed -gt 0 -and -not $Quiet) { Write-Warning "$differed expanded collection(s) differed from the individual re-read, $capConsistent of them consistent with the documented cap." }
 
 # ── 6. Evaluation matrix ────────────────────────────────────────────────────
 
@@ -784,9 +763,7 @@ $completeness = if     ($intentStatus -eq 'Absent') { 'Absent' }
 
 $observation = [pscustomobject]@{
     replicationIndicator = 'NotExposed'
-    expandCompleteness   = if ($disagreements -gt 0) { 'ReadsDisagree' }
-                           elseif ($truncated -gt 0)  { 'TruncatedAndRepaired' }
-                           else                       { 'NotContradicted' }
+    expandCompleteness   = if ($differed -gt 0) { 'ReadsDiffered' } else { 'NotContradicted' }
     freshness            = 'NotDemonstrated'
     note                 = 'Microsoft Graph documents replication delays on app role assignments and exposes no convergence indicator. That the snapshot read is current has not been established.'
 }
@@ -852,8 +829,8 @@ $report = [pscustomobject]@{
         scopedPrincipals         = $scope.Count
         zeroConfirmingReads      = $zeroConfirmingReads
         completenessReads        = $completenessReads
-        expandTruncated          = $truncated
-        expandReadsDisagree      = $disagreements
+        expandCollectionsDiffered   = $differed
+        differencesConsistentWithCap = $capConsistent
         grantStateNotObserved    = $notObserved.Count
         grantCompletenessUnverified = $grantsUnverified.Count
         evaluatedWithoutRows        = $withoutRows.ToArray()
