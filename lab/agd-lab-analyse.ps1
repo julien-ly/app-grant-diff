@@ -38,6 +38,12 @@ Set-StrictMode -Version Latest
 $TOOL_VERSION = '0.1.0'
 $ROLE_NUL     = '00000000-0000-0000-0000-000000000000'
 $GRAPH_APPID  = '00000003-0000-0000-c000-000000000000'
+# Maximum documente pour une relation developpee sur une ressource derivant de
+# directoryObject. Sert uniquement a distinguer une troncature plausible d'une
+# difference que le plafond ne peut pas expliquer, jamais a supposer que
+# l'expansion etait complete en dessous.
+# learn.microsoft.com/graph/query-parameters#expand
+$ExpandItemCap = 20
 
 if (-not $OutputDir) {
     $base = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
@@ -429,8 +435,13 @@ foreach ($id in @($perimetre)) {
     $idsComplet = @($complet | ForEach-Object { $_.Id })
     $ajoutes    = @($complet | Where-Object { $_.Id -notin $idsAvant })
     $retires    = @($idsAvant | Where-Object { $_ -notin $idsComplet })
-    $etaitTronquee     = $dejaRendu -and $ajoutes.Count -gt 0 -and $retires.Count -eq 0
-    $lecturesDivergent = $dejaRendu -and $retires.Count -gt 0
+    # Des ajouts seuls n'etablissent pas une troncature : une attribution
+    # accordee entre les deux lectures produit la meme forme. Le discriminant est
+    # le plafond documente : une expansion ne peut pas avoir ete plafonnee EN
+    # DESSOUS du plafond. Vingt rendus est compatible, trois ne l'est pas.
+    $auPlafondDocumente = $dejaRendu -and $expandCompte[$id] -ge $ExpandItemCap
+    $etaitTronquee     = $dejaRendu -and $ajoutes.Count -gt 0 -and $retires.Count -eq 0 -and $auPlafondDocumente
+    $lecturesDivergent = $dejaRendu -and ($retires.Count -gt 0 -or ($ajoutes.Count -gt 0 -and -not $auPlafondDocumente))
     $grantsParSpId[$id] = $complet
 
     if ($lecturesDivergent) {
@@ -450,7 +461,7 @@ foreach ($id in @($perimetre)) {
                 onlyInReRead         = @($libelles)
                 onlyInExpansionCount = $retires.Count
                 causeEstablished     = $false
-                note                 = 'Une expansion plafonnee et un changement entre les deux lectures produisent la meme difference. La relecture est retenue comme observation la plus recente.'
+                note                 = 'Le plafond documente n''explique pas cette difference, ou un element present dans l''expansion manque a la relecture. Un changement entre les deux lectures produit la meme forme. La relecture est retenue comme observation la plus recente.'
             })
     }
 
@@ -474,6 +485,7 @@ foreach ($id in @($perimetre)) {
                 expanded      = $expandCompte[$id]
                 actual        = $complet.Count
                 missing       = @($manquantes)
+                consistentWithDocumentedCap = $true
                 payloadSignal = if ($signale) { $signauxImbriques[$id] }
                                 else { 'Aucun lien de continuation ni compte annonce.' }
                 documented    = 'Au maximum 20 elements sont rendus pour une relation developpee sur une ressource derivant de directoryObject, sans @odata.nextLink.'

@@ -101,6 +101,11 @@ Set-StrictMode -Version Latest
 
 $ToolVersion  = '1.0.0'
 $NullRoleId   = '00000000-0000-0000-0000-000000000000'
+# Documented maximum for an expanded relationship on a directoryObject-derived
+# resource. Used only to tell a plausible truncation from a difference the cap
+# cannot explain - never to assume the expansion was complete below it.
+# learn.microsoft.com/graph/query-parameters#expand
+$ExpandItemCap = 20
 
 if (-not $OutputPath) { $OutputPath = Join-Path (Get-Location) 'report.json' }
 
@@ -471,8 +476,13 @@ foreach ($id in @($scope)) {
     $fullIds = @($full | ForEach-Object { $_.Id })
     $added   = @($full | Where-Object { $_.Id -notin $priorIds })
     $removed = @($priorIds | Where-Object { $_ -notin $fullIds })
-    $wasTruncated  = $alreadyRendered -and $added.Count -gt 0 -and $removed.Count -eq 0
-    $readsDisagree = $alreadyRendered -and $removed.Count -gt 0
+    # Additions alone do not establish truncation: an assignment granted between
+    # the two reads produces the same shape. The discriminator is the documented
+    # cap - an expansion cannot have been capped BELOW the cap. Twenty returned
+    # is consistent with truncation; three returned is not, whatever came after.
+    $atDocumentedCap = $alreadyRendered -and $expandCount[$id] -ge $ExpandItemCap
+    $wasTruncated  = $alreadyRendered -and $added.Count -gt 0 -and $removed.Count -eq 0 -and $atDocumentedCap
+    $readsDisagree = $alreadyRendered -and ($removed.Count -gt 0 -or ($added.Count -gt 0 -and -not $atDocumentedCap))
     $grantsBySpId[$id] = $full
 
     if ($readsDisagree) {
@@ -492,7 +502,7 @@ foreach ($id in @($scope)) {
                 onlyInReRead         = @($labels)
                 onlyInExpansionCount = $removed.Count
                 causeEstablished     = $false
-                note                 = 'A capped expansion and a change between the two reads produce the same difference. The re-read is retained as the later observation.'
+                note                 = 'The documented cap cannot explain this difference, or something present in the expansion is absent from the re-read. A change between the two reads produces the same shape. The re-read is retained as the later observation.'
             })
     }
 
@@ -516,6 +526,7 @@ foreach ($id in @($scope)) {
                 expanded      = $expandCount[$id]
                 actual        = $full.Count
                 missing       = @($missing)
+                consistentWithDocumentedCap = $true
                 payloadSignal = if ($signalled) { $nestedSignals[$id] }
                                 else { 'No continuation link and no announced count.' }
                 documented    = 'At most 20 items are returned for an expanded relationship on a directoryObject-derived resource, with no @odata.nextLink.'
