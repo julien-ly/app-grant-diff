@@ -468,7 +468,7 @@ foreach ($id in @($perimetre)) {
                                 else { 'Aucun lien de continuation ni compte annonce.' }
                 documented = 'Au maximum 20 elements sont rendus pour une relation developpee sur une ressource derivant de directoryObject, sans @odata.nextLink.'
                 reference  = 'https://learn.microsoft.com/graph/query-parameters#expand'
-                note       = 'Les deux lectures divergent. Une expansion plafonnee et un changement entre les deux lectures produisent la meme difference, et deux lectures ne permettent pas de les separer. La relecture est retenue comme observation la plus recente.'
+                note       = 'Les deux lectures different. Une expansion plafonnee et un changement entre les deux lectures produisent la meme difference, et deux lectures ne permettent pas de les separer. La relecture est retenue comme observation la plus recente.'
             })
     }
 }

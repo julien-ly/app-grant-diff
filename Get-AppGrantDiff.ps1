@@ -509,7 +509,7 @@ foreach ($id in @($scope)) {
                                 else { 'No continuation link and no announced count.' }
                 documented = 'At most 20 items are returned for an expanded relationship on a directoryObject-derived resource, with no @odata.nextLink.'
                 reference  = 'https://learn.microsoft.com/graph/query-parameters#expand'
-                note       = 'The two reads disagree. A capped expansion and a change between the two reads produce the same difference, and two reads cannot tell them apart. The re-read is retained as the later observation.'
+                note       = 'The two reads differ. A capped expansion and a change between the two reads produce the same difference, and two reads cannot tell them apart. The re-read is retained as the later observation.'
             })
     }
 }

@@ -1,7 +1,7 @@
 {
   "metadata": {
     "toolVersion": "1.0.0",
-    "generatedAt": "2026-09-18T07:59:30.0300549Z",
+    "generatedAt": "2026-09-18T08:08:14.4103605Z",
     "powerShellVersion": "7.6.6",
     "tenantId": "b58ec690-6b8a-4a87-8145-b34c83bda100",
     "disclaimer": "Conclusions are bounded to application permissions. Delegated permissions are not evaluated."
@@ -21,7 +21,7 @@
   "read": {
     "principalsTotal": 305,
     "expandPages": 4,
-    "expandDurationMs": 805,
+    "expandDurationMs": 1017,
     "relationRendered": 4,
     "scopedPrincipals": 9,
     "zeroConfirmingReads": 5,
@@ -478,7 +478,7 @@
         "payloadSignal": "No continuation link and no announced count.",
         "documented": "At most 20 items are returned for an expanded relationship on a directoryObject-derived resource, with no @odata.nextLink.",
         "reference": "https://learn.microsoft.com/graph/query-parameters#expand",
-        "note": "The two reads disagree. A capped expansion and a change between the two reads produce the same difference, and two reads cannot tell them apart. The re-read is retained as the later observation."
+        "note": "The two reads differ. A capped expansion and a change between the two reads produce the same difference, and two reads cannot tell them apart. The re-read is retained as the later observation."
       }
     }
   ]
