@@ -51,10 +51,14 @@
     in the payload to signal it. Every non-empty expanded collection is re-read
     individually before use. See README, "The $expand limit".
 
-    ABSENCE OF A PROPERTY IS NOT ZERO.
-    $expand omits appRoleAssignments entirely for principals that hold none. A
-    principal whose grant state was not observed receives no evaluation row: it
-    degrades assessment completeness and raises a diagnostic.
+    AN EMPTY RELATIONSHIP IS AN EMPTY ARRAY.
+    $expand returns appRoleAssignments as an empty array for principals that
+    hold none. Get-Field returns values from a function, and PowerShell emits
+    nothing for an empty array, so this version reads such a principal as not
+    rendered and re-reads it individually wherever a zero carries a conclusion:
+    a cost in calls, not in accuracy. A principal whose grant state was not
+    observed receives no evaluation row: it degrades assessment completeness
+    and raises a diagnostic.
 
     Application permissions only. Delegated permissions are out of scope:
     dynamic consent, consent type and multiple scopes in a single value make the

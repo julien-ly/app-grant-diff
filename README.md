@@ -139,9 +139,9 @@ Reading assignments principal by principal costs one call each. A single paginat
 GET /servicePrincipals?$select=id,appId,displayName&$expand=appRoleAssignments
 ```
 
-It also has two properties that make it unusable on its own.
+Two things matter when reading it.
 
-**Absence of the property is not zero.** `$expand` omits `appRoleAssignments` entirely for principals that hold none, rather than returning an empty array. A reader that treats the absence as zero converts an unobserved state into an observed one.
+**An empty relationship is an empty array.** For principals that hold none, `$expand` returns `appRoleAssignments` as an empty array, not as an absent property. Checked on 3 November 2026 with the request the tool sends, over 307 principals: none without the property, none at null, 303 with an empty array. Version 1.0.0 still reads those principals as not rendered: its field reader returns values from a PowerShell function, and a function that returns an empty array emits nothing, so the caller receives `$null`. Earlier versions of this README took that for an omission by Graph. The cost is calls, not accuracy: each such principal in scope is read individually wherever a zero carries a conclusion.
 
 **$expand establishes presence, never completeness.** For Entra resources deriving from `directoryObject`, `$expand` returns at most 20 items of the expanded relationship and no `@odata.nextLink`. Navigation properties never carry an `odata.count` annotation either. A principal holding more than 20 assignments is silently under-reported, with nothing in the payload to signal it. Verified in a lab tenant: a principal holding 25 assignments returned 20, the five missing ones scattered through the series rather than at the end.
 
